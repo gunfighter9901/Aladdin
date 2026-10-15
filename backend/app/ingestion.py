@@ -15,8 +15,11 @@ from sqlmodel import Session
 from app.config import UPLOAD_DIR, settings
 from app.errors import AppError
 from app.models import Source, utcnow
+from app.observability import truncate, update_trace
 from app.safety import assert_public_http_url, safe_error_message, safe_filename
 from app.vectorstore import get_store
+
+from opik import opik_context, track
 
 YOUTUBE_RE = re.compile(
     r"(?:youtube\.com/(?:watch\?.*v=|shorts/|embed/)|youtu\.be/)([A-Za-z0-9_-]{11})"
@@ -40,6 +43,33 @@ MIME_BY_EXT = {
 
 
 async def ingest_upload(
+    session: Session,
+    *,
+    file_name: str | None,
+    file_bytes: bytes | None,
+    url: str | None,
+    text: str | None,
+    title: str | None,
+) -> Source:
+    # File bytes / DB session are large or unserializable; exclude them
+    # from the Trace input. Log only sizes and names.
+    return await _ingest_span(
+        session,
+        file_name=file_name,
+        file_bytes=file_bytes,
+        url=url,
+        text=text,
+        title=title,
+    )
+
+
+@track(
+    name="ingest_source",
+    tags=["educator", "ingest"],
+    ignore_arguments=["session", "file_bytes"],
+    capture_output=False,
+)
+async def _ingest_span(
     session: Session,
     *,
     file_name: str | None,
@@ -88,6 +118,20 @@ async def ingest_upload(
         active=True,
         created_at=utcnow(),
     )
+    try:
+        opik_context.update_current_trace(
+            input={
+                "filename": filename,
+                "kind": kind,
+                "title": truncate(display, 200),
+                "url": truncate(origin, 500) if kind in {"url", "youtube"} else None,
+                "file_bytes": len(file_bytes) if file_bytes else 0,
+                "text_chars": len(text) if text else 0,
+            },
+            metadata={"source_id": source_id},
+        )
+    except Exception:
+        pass
     session.add(source)
     session.commit()
     session.refresh(source)
@@ -127,6 +171,18 @@ async def ingest_upload(
         session.add(source)
         session.commit()
         session.refresh(source)
+        update_trace(
+            output={
+                "source_id": source_id,
+                "filename": filename,
+                "chunk_count": count,
+                "status": "ready",
+            },
+            metadata={
+                "summary": truncate(summary, 1000),
+                "extracted_chars": len(joined),
+            },
+        )
         return source
     except Exception as exc:
         if upserted:

@@ -17,6 +17,8 @@ from app.config import settings
 from app.errors import GeminiUnavailable
 from app.safety import safe_error_message
 
+from opik import track
+
 QUIZ_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -91,106 +93,18 @@ class GeminiClient:
         return self._client
 
     async def generate_text(self, prompt: str, *, temperature: float = 0.4) -> str:
-        client = self.require()
-        try:
-            response = await client.aio.models.generate_content(
-                model=settings.reasoning_model,
-                contents=prompt,
-                config={"temperature": temperature},
-            )
-        except Exception as exc:
-            raise GeminiUnavailable(safe_error_message(exc)) from exc
-        text = (getattr(response, "text", None) or "").strip()
-        if not text:
-            raise GeminiUnavailable("The model returned an empty response.")
-        return text
+        return await _llm_text(self, prompt, temperature=temperature)
 
     async def generate_json(self, prompt: str, schema: dict[str, Any], *, temperature: float = 0.3) -> dict[str, Any]:
-        client = self.require()
-        from google.genai import types
-
-        config = types.GenerateContentConfig(
-            temperature=temperature,
-            response_mime_type="application/json",
-            response_schema=_as_schema(types, schema),
-        )
-        try:
-            response = await client.aio.models.generate_content(
-                model=settings.reasoning_model,
-                contents=prompt,
-                config=config,
-            )
-        except Exception as exc:
-            raise GeminiUnavailable(safe_error_message(exc)) from exc
-        raw = (getattr(response, "text", None) or "").strip()
-        if not raw:
-            raise GeminiUnavailable("The model returned an empty structured response.")
-        try:
-            parsed = json.loads(_strip_fence(raw))
-        except json.JSONDecodeError as exc:
-            raise GeminiUnavailable("The model did not return valid JSON.") from exc
-        if not isinstance(parsed, dict):
-            raise GeminiUnavailable("The model did not return a JSON object.")
-        return parsed
+        return await _llm_json(self, prompt, schema, temperature=temperature)
 
     async def transcribe(self, data: bytes, mime_type: str, prompt: str) -> str:
-        client = self.require()
-        from google.genai import types
-
-        part = _media_part(types, data, mime_type)
-        try:
-            response = await client.aio.models.generate_content(
-                model=settings.reasoning_model,
-                contents=[part, prompt],
-                config={"temperature": 0.2},
-            )
-        except Exception as exc:
-            raise GeminiUnavailable(safe_error_message(exc)) from exc
-        text = (getattr(response, "text", None) or "").strip()
-        if not text:
-            raise GeminiUnavailable("No text could be transcribed from that file.")
-        return text
+        # Audio/image bytes are large; log only sizes in the span.
+        return await _llm_transcribe(self, len(data), mime_type, data, prompt)
 
     async def synthesize_podcast(self, dialogue: str) -> tuple[str, str]:
         """Return (base64 wav, mime type) for 24 kHz multi-speaker speech."""
-        client = self.require()
-        from google.genai import types
-
-        config = types.GenerateContentConfig(
-            response_modalities=["AUDIO"],
-            speech_config=types.SpeechConfig(
-                multi_speaker_voice_config=types.MultiSpeakerVoiceConfig(
-                    speaker_voice_configs=[
-                        types.SpeakerVoiceConfig(
-                            speaker="Joe",
-                            voice_config=types.VoiceConfig(
-                                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Puck")
-                            ),
-                        ),
-                        types.SpeakerVoiceConfig(
-                            speaker="Jane",
-                            voice_config=types.VoiceConfig(
-                                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Kore")
-                            ),
-                        ),
-                    ]
-                )
-            ),
-        )
-        try:
-            response = await client.aio.models.generate_content(
-                model=settings.tts_model,
-                contents=dialogue,
-                config=config,
-            )
-        except Exception as exc:
-            raise GeminiUnavailable(safe_error_message(exc)) from exc
-        audio = _extract_audio(response)
-        if not audio:
-            raise GeminiUnavailable("Speech synthesis did not return audio.")
-        wav = audio if audio.startswith(b"RIFF") else _pcm_to_wav(audio)
-        encoded = base64.b64encode(wav).decode("ascii")
-        return encoded, "audio/wav"
+        return await _llm_tts(self, dialogue)
 
 
 def _as_schema(types: Any, schema: dict[str, Any]) -> Any:
@@ -253,6 +167,152 @@ def _strip_fence(text: str) -> str:
     if lines and lines[-1].strip() == "```":
         lines = lines[:-1]
     return "\n".join(lines).strip()
+
+
+@track(name="gemini_text", type="llm", ignore_arguments=["client"])
+async def _llm_text(client: GeminiClient, prompt: str, *, temperature: float) -> str:
+    from app.observability import truncate, update_span
+
+    raw = client.require()
+    try:
+        response = await raw.aio.models.generate_content(
+            model=settings.reasoning_model,
+            contents=prompt,
+            config={"temperature": temperature},
+        )
+    except Exception as exc:
+        raise GeminiUnavailable(safe_error_message(exc)) from exc
+    text = (getattr(response, "text", None) or "").strip()
+    if not text:
+        raise GeminiUnavailable("The model returned an empty response.")
+    update_span(
+        input={"prompt": truncate(prompt, 2000), "temperature": temperature},
+        output={"text": truncate(text, 2000)},
+        metadata={"model": settings.reasoning_model, "provider": "google"},
+        model=settings.reasoning_model,
+    )
+    return text
+
+
+@track(name="gemini_json", type="llm", ignore_arguments=["client"])
+async def _llm_json(
+    client: GeminiClient, prompt: str, schema: dict[str, Any], *, temperature: float
+) -> dict[str, Any]:
+    from app.observability import truncate, update_span
+
+    raw_client = client.require()
+    from google.genai import types
+
+    config = types.GenerateContentConfig(
+        temperature=temperature,
+        response_mime_type="application/json",
+        response_schema=_as_schema(types, schema),
+    )
+    try:
+        response = await raw_client.aio.models.generate_content(
+            model=settings.reasoning_model,
+            contents=prompt,
+            config=config,
+        )
+    except Exception as exc:
+        raise GeminiUnavailable(safe_error_message(exc)) from exc
+    raw = (getattr(response, "text", None) or "").strip()
+    if not raw:
+        raise GeminiUnavailable("The model returned an empty structured response.")
+    try:
+        parsed = json.loads(_strip_fence(raw))
+    except json.JSONDecodeError as exc:
+        raise GeminiUnavailable("The model did not return valid JSON.") from exc
+    if not isinstance(parsed, dict):
+        raise GeminiUnavailable("The model did not return a JSON object.")
+    update_span(
+        input={"prompt": truncate(prompt, 2000), "temperature": temperature},
+        output={"keys": sorted(parsed.keys())},
+        metadata={"model": settings.reasoning_model, "provider": "google"},
+        model=settings.reasoning_model,
+    )
+    return parsed
+
+
+@track(name="gemini_transcribe", type="llm", ignore_arguments=["client", "data"])
+async def _llm_transcribe(
+    client: GeminiClient, size: int, mime_type: str, data: bytes, prompt: str
+) -> str:
+    from app.observability import truncate, update_span
+
+    raw = client.require()
+    from google.genai import types
+
+    part = _media_part(types, data, mime_type)
+    try:
+        response = await raw.aio.models.generate_content(
+            model=settings.reasoning_model,
+            contents=[part, prompt],
+            config={"temperature": 0.2},
+        )
+    except Exception as exc:
+        raise GeminiUnavailable(safe_error_message(exc)) from exc
+    text = (getattr(response, "text", None) or "").strip()
+    if not text:
+        raise GeminiUnavailable("No text could be transcribed from that file.")
+    update_span(
+        input={"bytes": size, "mime_type": mime_type, "prompt": truncate(prompt, 500)},
+        output={"chars": len(text), "preview": truncate(text, 1000)},
+        metadata={"model": settings.reasoning_model, "provider": "google"},
+        model=settings.reasoning_model,
+    )
+    return text
+
+
+@track(name="gemini_tts", type="llm", capture_output=False, ignore_arguments=["client"])
+async def _llm_tts(client: GeminiClient, dialogue: str) -> tuple[str, str]:
+    """TTS audio is large; the span logs sizes only, never base64."""
+    from app.observability import truncate, update_span
+
+    raw = client.require()
+    from google.genai import types
+
+    config = types.GenerateContentConfig(
+        response_modalities=["AUDIO"],
+        speech_config=types.SpeechConfig(
+            multi_speaker_voice_config=types.MultiSpeakerVoiceConfig(
+                speaker_voice_configs=[
+                    types.SpeakerVoiceConfig(
+                        speaker="Joe",
+                        voice_config=types.VoiceConfig(
+                            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Puck")
+                        ),
+                    ),
+                    types.SpeakerVoiceConfig(
+                        speaker="Jane",
+                        voice_config=types.VoiceConfig(
+                            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Kore")
+                        ),
+                    ),
+                ]
+            )
+        ),
+    )
+    try:
+        response = await raw.aio.models.generate_content(
+            model=settings.tts_model,
+            contents=dialogue,
+            config=config,
+        )
+    except Exception as exc:
+        raise GeminiUnavailable(safe_error_message(exc)) from exc
+    audio = _extract_audio(response)
+    if not audio:
+        raise GeminiUnavailable("Speech synthesis did not return audio.")
+    wav = audio if audio.startswith(b"RIFF") else _pcm_to_wav(audio)
+    encoded = base64.b64encode(wav).decode("ascii")
+    update_span(
+        input={"dialogue_chars": len(dialogue), "preview": truncate(dialogue, 1000)},
+        output={"audio_bytes": len(wav), "mime": "audio/wav"},
+        metadata={"model": settings.tts_model, "provider": "google", "voices": {"Joe": "Puck", "Jane": "Kore"}},
+        model=settings.tts_model,
+    )
+    return encoded, "audio/wav"
 
 
 _client: GeminiClient | None = None

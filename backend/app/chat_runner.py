@@ -15,7 +15,7 @@ from sqlmodel import Session
 from app.agent import APP_NAME, USER_ID, runtime
 from app.database import engine
 from app.models import ChatSession, Message, Source, utcnow
-from app.observability import flush_tracer
+from app.observability import bind_thread, chunk_preview, flush_tracer, truncate, update_trace
 from app.runtime_context import (
     begin_artifacts,
     current_artifacts,
@@ -31,11 +31,32 @@ CITATION_RE = re.compile(
 )
 
 
+from opik import opik_context, track
+
+
+@track(name="educator_turn", tags=["educator", "chat"], capture_output=False)
 async def run_turn(
     session_id: str,
     message: str,
     active_source_ids: list[str],
 ) -> AsyncIterator[dict[str, Any]]:
+    # One user request = one Trace. Group all turns of a study session
+    # into one Thread so the Opik web app shows Threads > Traces > Spans.
+    if session_id:
+        try:
+            opik_context.update_current_trace(
+                thread_id=session_id,
+                tags=["educator", "chat"],
+                metadata={"user_id": USER_ID, "app": APP_NAME},
+                input={
+                    "session_id": session_id,
+                    "message": truncate(message, 4000),
+                    "active_source_ids": list(active_source_ids or []),
+                },
+            )
+        except Exception:
+            pass
+        bind_thread(session_id)
     if not runtime.ready or runtime.runner is None:
         yield {
             "event": "error",
@@ -152,6 +173,25 @@ async def run_turn(
             chat.updated_at = utcnow()
             db.add(chat)
         db.commit()
+
+    # Close the Trace with agent I/O, tool calls, and RAG chunks so the
+    # Opik web app shows Threads > Traces > Spans with full context.
+    tool_names = sorted({step.get("name") for step in trace if step.get("name")})
+    update_trace(
+        output={
+            "message_id": message_id,
+            "content": truncate(final_text, 4000),
+            "citations": citations,
+            "artifact_kinds": sorted(artifacts.keys()) if isinstance(artifacts, dict) else [],
+        },
+        metadata={
+            "active_source_ids": ids,
+            "tool_calls": tool_names,
+            "hit_count": len(retrieved),
+            "chunks": chunk_preview(retrieved),
+            "trace_steps": len(trace),
+        },
+    )
 
     yield {
         "event": "done",

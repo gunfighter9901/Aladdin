@@ -10,7 +10,10 @@ from pydantic import BaseModel, Field, ValidationError
 
 from app.errors import AppError, GeminiUnavailable
 from app.gemini_client import SCRIPT_SCHEMA, QUIZ_SCHEMA, get_gemini
+from app.observability import chunk_preview, truncate, update_span
 from app.vectorstore import Hit, get_store
+
+from opik import track
 
 MERMAID_STARTS = (
     "mindmap",
@@ -59,6 +62,11 @@ class ScriptPayload(BaseModel):
 
 
 async def generate_podcast(source_ids: list[str], focus: str = "") -> dict[str, Any]:
+    return await _podcast_pipeline(list(source_ids or []), focus or "")
+
+
+@track(name="podcast_pipeline", type="tool", capture_output=False)
+async def _podcast_pipeline(source_ids: list[str], focus: str) -> dict[str, Any]:
     context, _hits = await _study_context(source_ids, focus)
     topic = focus.strip() or "the main ideas a student should remember"
     prompt = f"""
@@ -106,6 +114,15 @@ Source excerpts:
         audio_b64, mime = await get_gemini().synthesize_podcast(dialogue)
     except GeminiUnavailable as exc:
         audio_error = exc.message
+    update_span(
+        input={"source_ids": source_ids, "focus": truncate(focus, 1000)},
+        output={
+            "title": script.title.strip() or "Study podcast",
+            "turn_count": len(turns),
+            "audio_ready": bool(audio_b64),
+        },
+        metadata={"audio_error": audio_error},
+    )
     return {
         "title": script.title.strip() or "Study podcast",
         "script": dialogue,
@@ -119,6 +136,11 @@ Source excerpts:
 
 
 async def generate_quiz(source_ids: list[str], focus: str = "", count: int = 5) -> dict[str, Any]:
+    return await _quiz_pipeline(list(source_ids or []), focus or "", count)
+
+
+@track(name="quiz_pipeline", type="tool")
+async def _quiz_pipeline(source_ids: list[str], focus: str, count: int) -> dict[str, Any]:
     context, _hits = await _study_context(source_ids, focus)
     topic = focus.strip() or "the ideas that matter most in these excerpts"
     prompt = f"""
@@ -161,6 +183,10 @@ Source excerpts:
         for index, card in enumerate(quiz.flashcards, start=1)
         if card.front.strip() and card.back.strip()
     ]
+    update_span(
+        input={"source_ids": source_ids, "focus": truncate(focus, 1000), "count": count},
+        output={"title": quiz.title.strip() or "Active recall", "question_count": len(questions)},
+    )
     return {"title": quiz.title.strip() or "Active recall", "questions": questions, "flashcards": flashcards}
 
 
@@ -169,6 +195,11 @@ async def generate_infographic(
     focus: str = "",
     diagram_type: str = "mindmap",
 ) -> dict[str, Any]:
+    return await _infographic_pipeline(list(source_ids or []), focus or "", diagram_type or "mindmap")
+
+
+@track(name="infographic_pipeline", type="tool")
+async def _infographic_pipeline(source_ids: list[str], focus: str, diagram_type: str) -> dict[str, Any]:
     context, _hits = await _study_context(source_ids, focus)
     kind = diagram_type if diagram_type in DIAGRAM_HINTS else "mindmap"
     hint = DIAGRAM_HINTS[kind]
@@ -200,10 +231,20 @@ Source excerpts:
     if not _valid_mermaid(mermaid):
         raise GeminiUnavailable("The diagram was not valid Mermaid markup.")
     title = topic[:80] if focus.strip() else f"{kind.title()} from your sources"
+    update_span(
+        input={"source_ids": source_ids, "focus": truncate(focus, 1000), "diagram_type": kind},
+        output={"title": title, "diagram_type": kind},
+        metadata={"mermaid": truncate(mermaid, 2000)},
+    )
     return {"title": title, "diagramType": kind, "mermaid": mermaid}
 
 
 async def summarize_source(filename: str, text: str) -> str:
+    return await _summarize_span(filename, text)
+
+
+@track(name="summarize_source", type="tool")
+async def _summarize_span(filename: str, text: str) -> str:
     excerpt = text.strip()[:8000]
     if not excerpt:
         return ""
@@ -221,6 +262,11 @@ async def summarize_source(filename: str, text: str) -> str:
 
 
 async def _study_context(source_ids: list[str], focus: str) -> tuple[str, list[Hit]]:
+    return await _retrieve_study_context(list(source_ids or []), focus or "")
+
+
+@track(name="retrieve_study_context", type="tool")
+async def _retrieve_study_context(source_ids: list[str], focus: str) -> tuple[str, list[Hit]]:
     ids = [item for item in source_ids if item]
     if not ids:
         raise AppError("Select at least one source. An empty selection retrieves nothing.")
@@ -236,7 +282,13 @@ async def _study_context(source_ids: list[str], focus: str) -> tuple[str, list[H
     for hit in hits:
         page = f", page {hit.page_number}" if hit.page_number else ""
         blocks.append(f"[Source: {hit.filename}, Chunk: {hit.chunk_id}{page}]\n{hit.text}")
-    return _truncate_at_sentence("\n\n".join(blocks), 14000), hits
+    context = _truncate_at_sentence("\n\n".join(blocks), 14000)
+    update_span(
+        input={"source_ids": ids, "focus": truncate(focus, 1000)},
+        output={"hit_count": len(hits), "context_chars": len(context)},
+        metadata={"chunks": chunk_preview(hits)},
+    )
+    return context, hits
 
 
 def _truncate_at_sentence(text: str, limit: int) -> str:
