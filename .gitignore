@@ -1,0 +1,31 @@
+# Secrets
+.env
+backend/.env
+frontend/.env
+frontend/.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.python-version
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# App data (SQLite, Qdrant, uploads, embedding cache)
+backend/data/
+data/
+
+# Node
+node_modules/
+frontend/dist/
+frontend/node_modules/
+*.tsbuildinfo
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
