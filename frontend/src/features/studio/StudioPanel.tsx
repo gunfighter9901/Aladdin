@@ -33,7 +33,7 @@ export function StudioPanel({ artifacts, busy, canGenerate, onGenerate }: Props)
       <div className="panel-head">
         <div>
           <h2>Studio</h2>
-          <p>Podcasts, active recall, and diagrams from the checked sources only.</p>
+          <p>Podcasts, Quiz, and diagrams from the checked sources only.</p>
         </div>
       </div>
       <div className="tabs" role="tablist">
@@ -263,7 +263,7 @@ let mermaidInitialized = false;
 
 function ensureMermaid() {
   if (!mermaidInitialized) {
-    mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: "neutral" });
+    mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: "dark" });
     mermaidInitialized = true;
   }
 }

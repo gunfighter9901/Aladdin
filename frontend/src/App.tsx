@@ -46,6 +46,7 @@ export function App() {
   const [liveText, setLiveText] = useState("");
   const [studioBusy, setStudioBusy] = useState<"podcast" | "quiz" | "infographic" | null>(null);
   const [highlightedId, setHighlightedId] = useState<string | null>(null);
+  const [sourcesCollapsed, setSourcesCollapsed] = useState(false);
   const sessionIdRef = useRef<string | null>(null);
   const openRequestRef = useRef(0);
   const chatAbortRef = useRef<AbortController | null>(null);
@@ -313,8 +314,8 @@ export function App() {
             </svg>
           </div>
           <div>
-            <h1>Educator</h1>
-            <p>Local tutor for the materials on this machine.</p>
+            <h1>Aladdin</h1>
+            <p>The smart AI tutor that never leaves your machine.</p>
           </div>
         </div>
         <div className="pills">
@@ -332,12 +333,14 @@ export function App() {
           </div>
         ) : null}
       </header>
-      <main className="workspace">
+      <main className={`workspace${sourcesCollapsed ? " sources-collapsed" : ""}`}>
         <SourcePanel
           sources={sources}
           collection={collection}
           busy={uploading}
           highlightedId={highlightedId}
+          collapsed={sourcesCollapsed}
+          onToggleCollapse={() => setSourcesCollapsed((value) => !value)}
           onUpload={onUpload}
           onToggle={onToggle}
           onDelete={onDelete}

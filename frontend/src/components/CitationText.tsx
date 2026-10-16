@@ -1,4 +1,6 @@
-import type { ReactNode } from "react";
+import { useMemo } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import type { Citation } from "../types";
 
 type Props = {
@@ -10,8 +12,44 @@ type Props = {
 const CITATION = /\[Source:\s*([^,\]]+?),\s*Chunk:\s*([^\]]+?)\s*\]/g;
 
 export function CitationText({ text, citations, onOpenSource }: Props) {
-  const nodes = renderChunks(text, citations, onOpenSource);
-  return <div className="answer">{nodes}</div>;
+  const { markdown, refs } = useMemo(() => toMarkdownWithCiteLinks(text, citations), [text, citations]);
+
+  return (
+    <div className="answer markdown">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          a({ href, children }) {
+            if (href?.startsWith("#cite-")) {
+              const index = Number(href.slice("#cite-".length));
+              const citation = Number.isFinite(index) ? refs[index] : null;
+              if (citation && onOpenSource) {
+                const target = citation;
+                return (
+                  <button
+                    type="button"
+                    className="cite"
+                    onClick={() => onOpenSource(target.sourceId)}
+                    title={`Open ${target.filename}`}
+                  >
+                    {children}
+                  </button>
+                );
+              }
+              return <span className="cite-plain">{children}</span>;
+            }
+            return (
+              <a href={href} target="_blank" rel="noreferrer">
+                {children}
+              </a>
+            );
+          },
+        }}
+      >
+        {markdown}
+      </ReactMarkdown>
+    </div>
+  );
 }
 
 function findCitation(citations: Citation[], filename: string, chunkId: string) {
@@ -28,41 +66,14 @@ function findCitation(citations: Citation[], filename: string, chunkId: string) 
   return citations.find((item) => item.chunkId === chunkId || item.chunkId.toLowerCase() === lowerChunk);
 }
 
-function renderChunks(
-  text: string,
-  citations: Citation[],
-  onOpenSource?: (sourceId: string) => void,
-) {
-  const nodes: ReactNode[] = [];
-  const pattern = new RegExp(CITATION);
-  let last = 0;
-  let match: RegExpExecArray | null;
-  while ((match = pattern.exec(text)) !== null) {
-    const index = match.index;
-    if (index > last) nodes.push(text.slice(last, index));
-    const filename = match[1]?.trim() ?? "source";
-    const chunkId = match[2]?.trim() ?? "";
-    const citation = findCitation(citations, filename, chunkId);
-    const actionable = Boolean(citation && onOpenSource);
-    nodes.push(
-      actionable ? (
-        <button
-          key={`${index}-${chunkId}`}
-          type="button"
-          className="cite"
-          onClick={() => citation && onOpenSource?.(citation.sourceId)}
-          title={`Open ${citation?.filename}`}
-        >
-          {filename} · {chunkId}
-        </button>
-      ) : (
-        <span key={`${index}-${chunkId}`} className="cite-plain" title={filename}>
-          {filename} · {chunkId}
-        </span>
-      ),
-    );
-    last = index + match[0].length;
-  }
-  if (last < text.length) nodes.push(text.slice(last));
-  return nodes;
+function toMarkdownWithCiteLinks(text: string, citations: Citation[]) {
+  const refs: Array<Citation | null> = [];
+  const markdown = text.replace(CITATION, (_full, rawFilename: string, rawChunkId: string) => {
+    const filename = (rawFilename ?? "").trim() || "source";
+    const chunkId = (rawChunkId ?? "").trim();
+    refs.push(findCitation(citations, filename, chunkId) ?? null);
+    const label = `${filename} · ${chunkId}`.replace(/[\[\]]/g, "").slice(0, 120);
+    return `[${label}](#cite-${refs.length - 1})`;
+  });
+  return { markdown, refs };
 }

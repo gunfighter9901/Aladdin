@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     app_host: str = Field(default="127.0.0.1", validation_alias="APP_HOST")
     app_port: int = Field(default=8000, validation_alias="APP_PORT")
 
-    reasoning_model: str = "gemini-3.1-flash-lite"
+    reasoning_model: str = "gemini-3.5-flash-lite"
     tts_model: str = "gemini-3.1-flash-tts-preview"
     embedding_model: str = "BAAI/bge-small-en-v1.5"
 

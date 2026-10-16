@@ -49,23 +49,8 @@ export function ChatPanel({
 
   return (
     <section className="panel" aria-label="Tutor">
-      <div className="panel-head">
-        <div>
-          <h2>Tutor</h2>
-          <p>Answers cite the checked sources. If the material does not contain it, the tutor says so.</p>
-        </div>
-        <div className="row">
-          <button className="btn-ghost" type="button" onClick={onNewSession}>
-            New
-          </button>
-          <button className="btn-danger" type="button" onClick={onDeleteSession} disabled={!sessionId}>
-            Delete
-          </button>
-        </div>
-      </div>
-      <div className="scroll" style={{ paddingBottom: 8 }}>
-        <label className="field">
-          Session
+      <div className="session-bar">
+        <div className="session-select grow">
           <select
             value={sessionId ?? ""}
             onChange={(event) => onSelectSession(event.target.value)}
@@ -78,12 +63,23 @@ export function ChatPanel({
               </option>
             ))}
           </select>
-        </label>
+          <span className="session-tag" aria-hidden="true">
+            Session
+          </span>
+        </div>
+        <div className="row session-actions">
+          <button className="btn-ghost session-btn" type="button" onClick={onNewSession}>
+            New
+          </button>
+          <button className="btn-danger session-btn" type="button" onClick={onDeleteSession} disabled={!sessionId}>
+            Delete
+          </button>
+        </div>
       </div>
       <div className="scroll chat-scroll">
         {messages.length === 0 && !busy ? (
-          <div className="empty">
-            <strong>Ask about the sources you checked.</strong>
+          <div className="empty chat-empty">
+            <div className="chat-empty-title">Ask about the sources you checked.</div>
             <p>Try “Explain the main argument” or “Make a quiz on the second source.”</p>
           </div>
         ) : null}
@@ -95,7 +91,7 @@ export function ChatPanel({
             ) : (
               message.content
             )}
-            {message.trace.length > 0 ? <TraceList steps={message.trace} /> : null}
+            {message.trace.length > 0 ? <TraceToggle steps={message.trace} /> : null}
           </article>
         ))}
         {busy ? (
@@ -106,31 +102,43 @@ export function ChatPanel({
             ) : (
               <p className="hint">{status || "Working through the sources…"}</p>
             )}
-            {liveTrace.length > 0 ? <TraceList steps={liveTrace} /> : null}
+            {liveTrace.length > 0 ? <TraceToggle steps={liveTrace} /> : null}
           </article>
         ) : null}
         <div ref={endRef} />
       </div>
       <form className="composer" onSubmit={submit}>
-        <label className="field">
-          Question
-          <textarea
-            value={draft}
-            onChange={(event) => setDraft(event.target.value)}
-            placeholder="Ask a question, or ask for a podcast, quiz, or diagram."
-            onKeyDown={(event) => {
-              if (event.key === "Enter" && !event.shiftKey) {
-                event.preventDefault();
-                event.currentTarget.form?.requestSubmit();
-              }
-            }}
-          />
-        </label>
+        <textarea
+          value={draft}
+          onChange={(event) => setDraft(event.target.value)}
+          placeholder="Ask a question, or ask for a podcast, quiz, or diagram."
+          aria-label="Question"
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && !event.shiftKey) {
+              event.preventDefault();
+              event.currentTarget.form?.requestSubmit();
+            }
+          }}
+        />
         <button className="btn" type="submit" disabled={busy || !draft.trim() || !sessionId}>
           {busy ? "Thinking" : "Ask"}
         </button>
       </form>
     </section>
+  );
+}
+
+function TraceToggle({ steps }: { steps: TraceStep[] }) {
+  const toolNames = steps
+    .filter((step) => step.type === "tool_call")
+    .map((step) => step.name ?? "tool")
+    .filter((name, index, all) => all.indexOf(name) === index);
+  const label = toolNames.length > 0 ? `Tools: ${toolNames.join(", ")}` : `Trace (${steps.length})`;
+  return (
+    <details className="trace-toggle">
+      <summary title="Show tool calls and retrieved chunks">{label}</summary>
+      <TraceList steps={steps} />
+    </details>
   );
 }
 
