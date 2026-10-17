@@ -13,9 +13,10 @@ from google.genai import types as genai_types
 from sqlmodel import Session
 
 from app.agent import APP_NAME, USER_ID, runtime
+from app.config import settings
 from app.database import engine
 from app.models import ChatSession, Message, Source, utcnow
-from app.observability import flush_tracer
+from app.observability import bind_thread, chunk_preview, flush_tracer, truncate, update_trace
 from app.runtime_context import (
     begin_artifacts,
     current_artifacts,
@@ -31,11 +32,32 @@ CITATION_RE = re.compile(
 )
 
 
+from opik import opik_context, track
+
+
+@track(name="educator_turn", tags=["educator", "chat"], capture_output=False)
 async def run_turn(
     session_id: str,
     message: str,
     active_source_ids: list[str],
 ) -> AsyncIterator[dict[str, Any]]:
+    # One user request = one Trace. Group all turns of a study session
+    # into one Thread so the Opik web app shows Threads > Traces > Spans.
+    if session_id:
+        try:
+            opik_context.update_current_trace(
+                thread_id=session_id,
+                tags=["educator", "chat"],
+                metadata={"user_id": USER_ID, "app": APP_NAME},
+                input={
+                    "session_id": session_id,
+                    "message": truncate(message, 4000),
+                    "active_source_ids": list(active_source_ids or []),
+                },
+            )
+        except Exception:
+            pass
+        bind_thread(session_id)
     if not runtime.ready or runtime.runner is None:
         yield {
             "event": "error",
@@ -70,7 +92,7 @@ async def run_turn(
         )
         db.add(user_message)
         if chat.title == "New study session":
-            chat.title = text[:72]
+            chat.title = _clean_title(text)
         chat.updated_at = utcnow()
         db.add(chat)
         db.commit()
@@ -78,13 +100,16 @@ async def run_turn(
     yield {"event": "status", "data": {"text": "The tutor is reading the selected sources."}}
     await _ensure_adk_session(session_id)
 
-    ids = [info["id"] for info in source_infos]
+    ids = [info["id"] for info in source_infos][: max(1, settings.max_sources_per_query)]
     id_token = set_active_source_ids(ids)
     artifact_token = begin_artifacts()
     trace: list[dict[str, Any]] = []
     retrieved: list[Hit] = []
     final_text = ""
     partial_text: list[str] = []
+    failed = False
+    failure_message = ""
+    failure_status = 502
     content = _user_content(_agent_message(text, source_infos))
 
     try:
@@ -115,8 +140,17 @@ async def run_turn(
             if event_text and not partial and _is_final(event):
                 final_text = event_text
     except Exception as exc:
-        final_text = safe_error_message(exc)
-        trace.append({"type": "status", "name": "error", "text": final_text})
+        # Do not persist the failure as an assistant answer: it would poison
+        # the stored history and the next turn's context. Record it in the
+        # trace, then yield an error below when the model produced nothing.
+        failed = True
+        failure_message = safe_error_message(exc)
+        failure_status = getattr(exc, "status_code", 502) or 502
+        try:
+            failure_status = int(failure_status)
+        except (TypeError, ValueError):
+            failure_status = 502
+        trace.append({"type": "status", "name": "error", "text": failure_message})
     finally:
         flush_tracer(runtime.tracer)
         reset_active_source_ids(id_token)
@@ -130,6 +164,13 @@ async def run_turn(
     if not final_text:
         final_text = "".join(partial_text).strip()
     if not final_text:
+        if failed:
+            update_trace(
+                output={"error": failure_message, "hit_count": len(retrieved)},
+                metadata={"active_source_ids": ids, "trace_steps": len(trace)},
+            )
+            yield {"event": "error", "data": {"message": failure_message, "status": failure_status}}
+            return
         final_text = "The tutor did not produce an answer. Try asking again in a moment."
 
     citations = _citations(final_text, retrieved)
@@ -153,6 +194,25 @@ async def run_turn(
             db.add(chat)
         db.commit()
 
+    # Close the Trace with agent I/O, tool calls, and RAG chunks so the
+    # Opik web app shows Threads > Traces > Spans with full context.
+    tool_names = sorted({step.get("name") for step in trace if step.get("name")})
+    update_trace(
+        output={
+            "message_id": message_id,
+            "content": truncate(final_text, 4000),
+            "citations": citations,
+            "artifact_kinds": sorted(artifacts.keys()) if isinstance(artifacts, dict) else [],
+        },
+        metadata={
+            "active_source_ids": ids,
+            "tool_calls": tool_names,
+            "hit_count": len(retrieved),
+            "chunks": chunk_preview(retrieved),
+            "trace_steps": len(trace),
+        },
+    )
+
     yield {
         "event": "done",
         "data": {
@@ -166,10 +226,18 @@ async def run_turn(
     }
 
 
+def _clean_title(text: str) -> str:
+    """Single-line session title without control characters."""
+    cleaned = " ".join(text.split())
+    return cleaned[:72] or "Study session"
+
+
 def _selected_sources(db: Session, source_ids: list[str]) -> list[Source]:
+    from app.config import settings as _settings
+
     selected: list[Source] = []
     seen: set[str] = set()
-    for source_id in source_ids:
+    for source_id in (source_ids or [])[: max(1, _settings.max_sources_per_query)]:
         if not source_id or source_id in seen:
             continue
         source = db.get(Source, source_id)

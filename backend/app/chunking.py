@@ -6,12 +6,16 @@ The embedding model truncates at 512 wordpiece tokens. Chunks are capped at
 
 from __future__ import annotations
 
+import re
+import threading
 from dataclasses import dataclass
 
 from huggingface_hub import hf_hub_download
 from tokenizers import Tokenizer
 
 from app.config import settings
+
+_SENTENCE_END = re.compile(r"[.!?][\"')\]]*\s+")
 
 
 @dataclass(frozen=True)
@@ -37,6 +41,7 @@ class TokenChunker:
 
     def chunk_document(self, pages: list[tuple[int | None, str]]) -> list[TextChunk]:
         chunks: list[TextChunk] = []
+        cap = max(1, settings.max_chunks_per_source)
         for page_number, text in pages:
             cleaned = _normalize(text)
             if not cleaned:
@@ -53,6 +58,8 @@ class TokenChunker:
                         token_count=self.count(piece),
                     )
                 )
+                if len(chunks) >= cap:
+                    return chunks
         return chunks
 
     def _split(self, text: str) -> list[str]:
@@ -77,15 +84,18 @@ class TokenChunker:
         return pieces
 
     def _split_sentences(self, text: str) -> list[str]:
+        # Split on sentence punctuation without re-encoding the growing
+        # buffer on every character (the old loop called count() per char).
         rough: list[str] = []
-        buf = ""
-        for char in text:
-            buf += char
-            if char in ".!?" and self.count(buf) > 40:
-                rough.append(buf.strip())
-                buf = ""
-        if buf.strip():
-            rough.append(buf.strip())
+        start = 0
+        for match in _SENTENCE_END.finditer(text):
+            candidate = text[start : match.end()].strip()
+            if candidate and self.count(candidate) > 40:
+                rough.append(candidate)
+                start = match.end()
+        tail = text[start:].strip()
+        if tail:
+            rough.append(tail)
         pieces: list[str] = []
         for sentence in rough:
             if self.count(sentence) <= self.max_tokens:
@@ -165,10 +175,19 @@ def _normalize(text: str) -> str:
 
 
 _chunker: TokenChunker | None = None
+_chunker_lock = threading.Lock()
 
 
 def get_chunker() -> TokenChunker:
     global _chunker
-    if _chunker is None:
-        _chunker = TokenChunker()
-    return _chunker
+    if _chunker is not None:
+        return _chunker
+    with _chunker_lock:
+        if _chunker is None:
+            _chunker = TokenChunker()
+        return _chunker
+
+
+def warm_chunker() -> None:
+    """Load the tokenizer eagerly at startup so the first request pays no download cost."""
+    get_chunker()

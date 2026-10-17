@@ -6,6 +6,7 @@ from the model schema only when it can see the real ``ToolContext`` type.
 
 import inspect
 import logging
+import threading
 from typing import Any
 
 try:
@@ -15,7 +16,7 @@ except ImportError:  # pragma: no cover - layout differs across ADK releases
 
 from app.config import settings
 from app.errors import AppError
-from app.observability import flush_tracer, instrument_agent
+from app.observability import chunk_preview, flush_tracer, instrument_agent, truncate, update_span
 from app.prompts import TUTOR_INSTRUCTION
 from app.runtime_context import active_source_ids, push_artifact
 from app.safety import safe_error_message
@@ -71,14 +72,23 @@ async def rag_retriever(query: str, tool_context: ToolContext) -> dict[str, Any]
     Returns:
         Hits limited to the active sources, with filename and chunkId for citations.
     """
+    # NOTE: No @track here on purpose. ADK's OpikTracer already opens a tool
+    # Span for this call (via OpenTelemetry). update_span() below enriches
+    # that Span with the query and RAG chunks, so the Opik web app shows
+    # Trace -> tool Span -> qdrant Span without duplicate spans.
     import asyncio
 
     from app.vectorstore import get_store
 
     if not query.strip():
+        update_span(output={"status": "error", "hit_count": 0})
         return {"status": "error", "message": "A search query is required.", "hits": []}
     ids = active_source_ids(tool_context)
     if not ids:
+        update_span(
+            input={"query": truncate(query, 1000), "active_source_ids": []},
+            output={"status": "empty", "hit_count": 0},
+        )
         return {
             "status": "empty",
             "message": "No sources are selected. Retrieval returned nothing.",
@@ -86,12 +96,16 @@ async def rag_retriever(query: str, tool_context: ToolContext) -> dict[str, Any]
         }
     hits = await asyncio.to_thread(get_store().search, query, ids, settings.retrieval_limit)
     if not hits:
+        update_span(
+            input={"query": truncate(query, 1000), "active_source_ids": ids},
+            output={"status": "no_hits", "hit_count": 0},
+        )
         return {
             "status": "no_hits",
             "message": "The selected materials do not contain a matching passage.",
             "hits": [],
         }
-    return {
+    payload = {
         "status": "ok",
         "message": "Use only these passages. Cite each claim you take from them.",
         "hits": [
@@ -106,6 +120,12 @@ async def rag_retriever(query: str, tool_context: ToolContext) -> dict[str, Any]
             for hit in hits
         ],
     }
+    update_span(
+        input={"query": truncate(query, 1000), "active_source_ids": ids},
+        output={"status": "ok", "hit_count": len(hits)},
+        metadata={"chunks": chunk_preview(hits)},
+    )
+    return payload
 
 
 async def podcast_generator(focus: str, tool_context: ToolContext) -> dict[str, Any]:
@@ -121,12 +141,31 @@ async def podcast_generator(focus: str, tool_context: ToolContext) -> dict[str, 
 
     ids = active_source_ids(tool_context)
     if not ids:
+        update_span(
+            input={"focus": truncate(focus, 1000)},
+            output={"status": "empty"},
+        )
         return {"status": "empty", "message": "Select at least one source before making a podcast."}
     try:
         payload = await generate_podcast(ids, focus)
     except Exception as exc:
+        update_span(
+            input={"focus": truncate(focus, 1000), "source_ids": ids},
+            output={"status": "error"},
+            metadata={"error": truncate(_tool_error(exc), 500)},
+        )
         return {"status": "error", "message": _tool_error(exc)}
     push_artifact("podcast", payload, tool_context)
+    update_span(
+        input={"focus": truncate(focus, 1000), "source_ids": ids},
+        output={
+            "status": "ok",
+            "title": payload.get("title"),
+            "turns": len(payload.get("turns") or []),
+            "audioReady": bool(payload.get("audioBase64")),
+        },
+        metadata={"audio_error": payload.get("audioError")},
+    )
     return {
         "status": "ok",
         "title": payload.get("title"),
@@ -147,12 +186,24 @@ async def quiz_generator(focus: str, count: int, tool_context: ToolContext) -> d
 
     ids = active_source_ids(tool_context)
     if not ids:
+        update_span(output={"status": "empty"})
         return {"status": "empty", "message": "Select at least one source before making a quiz."}
     try:
-        payload = await generate_quiz(ids, focus, max(1, min(int(count or 5), 12)))
+        requested = int(count if count is not None else 5)
+    except (TypeError, ValueError):
+        return {"status": "error", "message": "Count must be a whole number between 1 and 12."}
+    requested = max(1, min(requested, 12))
+    try:
+        payload = await generate_quiz(ids, focus, requested)
     except Exception as exc:
+        update_span(output={"status": "error"}, metadata={"error": truncate(_tool_error(exc), 500)})
         return {"status": "error", "message": _tool_error(exc)}
     push_artifact("quiz", payload, tool_context)
+    questions = payload.get("questions") or []
+    update_span(
+        input={"focus": truncate(focus, 1000), "count": count, "source_ids": ids},
+        output={"status": "ok", "title": payload.get("title"), "question_count": len(questions)},
+    )
     return {"status": "ok", **payload}
 
 
@@ -167,13 +218,20 @@ async def infographic_creator(focus: str, diagram_type: str, tool_context: ToolC
 
     ids = active_source_ids(tool_context)
     if not ids:
+        update_span(output={"status": "empty"})
         return {"status": "empty", "message": "Select at least one source before making a diagram."}
     kind = diagram_type if diagram_type in {"mindmap", "flowchart", "timeline", "sequence"} else "mindmap"
     try:
         payload = await generate_infographic(ids, focus, kind)
     except Exception as exc:
+        update_span(output={"status": "error"}, metadata={"error": truncate(_tool_error(exc), 500)})
         return {"status": "error", "message": _tool_error(exc)}
     push_artifact("infographic", payload, tool_context)
+    update_span(
+        input={"focus": truncate(focus, 1000), "diagram_type": kind, "source_ids": ids},
+        output={"status": "ok", "title": payload.get("title")},
+        metadata={"mermaid": truncate((payload.get("mermaid") or ""), 2000)},
+    )
     return {"status": "ok", **payload}
 
 
@@ -190,37 +248,51 @@ class AgentRuntime:
         self.session_service = None
         self.tracer = None
         self.ready = False
+        self._lock = threading.Lock()
 
     def start(self) -> None:
-        from google.adk.agents import LlmAgent
-        from google.adk.runners import Runner
-        from google.adk.sessions import DatabaseSessionService
+        with self._lock:
+            if self.ready:
+                logger.info("ADK educator agent is already running; start() is a no-op")
+                return
+            from google.adk.agents import LlmAgent
+            from google.adk.runners import Runner
+            from google.adk.sessions import DatabaseSessionService
 
-        self.session_service = DatabaseSessionService(
-            db_url=f"sqlite+aiosqlite:///{settings.adk_sqlite_path}"
-        )
-        web_search = build_web_search_tool(settings.reasoning_model)
-        self.agent = LlmAgent(
-            name="educator",
-            model=settings.reasoning_model,
-            description="A local tutor that answers from the student's selected materials and cites them.",
-            instruction=TUTOR_INSTRUCTION,
-            tools=[
-                rag_retriever,
-                web_search,
-                podcast_generator,
-                quiz_generator,
-                infographic_creator,
-            ],
-        )
-        self.tracer = instrument_agent(self.agent)
-        self.runner = Runner(
-            agent=self.agent,
-            app_name=APP_NAME,
-            session_service=self.session_service,
-        )
-        self.ready = True
-        logger.info("ADK educator agent is ready")
+            try:
+                self.session_service = DatabaseSessionService(
+                    db_url=f"sqlite+aiosqlite:///{settings.adk_sqlite_path}"
+                )
+                web_search = build_web_search_tool(settings.reasoning_model)
+                self.agent = LlmAgent(
+                    name="educator",
+                    model=settings.reasoning_model,
+                    description="A local tutor that answers from the student's selected materials and cites them.",
+                    instruction=TUTOR_INSTRUCTION,
+                    tools=[
+                        rag_retriever,
+                        web_search,
+                        podcast_generator,
+                        quiz_generator,
+                        infographic_creator,
+                    ],
+                )
+                self.tracer = instrument_agent(self.agent)
+                self.runner = Runner(
+                    agent=self.agent,
+                    app_name=APP_NAME,
+                    session_service=self.session_service,
+                )
+            except Exception:
+                logger.exception("ADK educator agent failed to start")
+                self.agent = None
+                self.runner = None
+                self.session_service = None
+                self.tracer = None
+                self.ready = False
+                raise
+            self.ready = True
+            logger.info("ADK educator agent is ready")
 
     async def prepare(self) -> None:
         service = self.session_service

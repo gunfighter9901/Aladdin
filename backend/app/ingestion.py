@@ -15,8 +15,11 @@ from sqlmodel import Session
 from app.config import UPLOAD_DIR, settings
 from app.errors import AppError
 from app.models import Source, utcnow
+from app.observability import truncate, update_trace
 from app.safety import assert_public_http_url, safe_error_message, safe_filename
 from app.vectorstore import get_store
+
+from opik import opik_context, track
 
 YOUTUBE_RE = re.compile(
     r"(?:youtube\.com/(?:watch\?.*v=|shorts/|embed/)|youtu\.be/)([A-Za-z0-9_-]{11})"
@@ -40,6 +43,33 @@ MIME_BY_EXT = {
 
 
 async def ingest_upload(
+    session: Session,
+    *,
+    file_name: str | None,
+    file_bytes: bytes | None,
+    url: str | None,
+    text: str | None,
+    title: str | None,
+) -> Source:
+    # File bytes / DB session are large or unserializable; exclude them
+    # from the Trace input. Log only sizes and names.
+    return await _ingest_span(
+        session,
+        file_name=file_name,
+        file_bytes=file_bytes,
+        url=url,
+        text=text,
+        title=title,
+    )
+
+
+@track(
+    name="ingest_source",
+    tags=["educator", "ingest"],
+    ignore_arguments=["session", "file_bytes"],
+    capture_output=False,
+)
+async def _ingest_span(
     session: Session,
     *,
     file_name: str | None,
@@ -88,6 +118,20 @@ async def ingest_upload(
         active=True,
         created_at=utcnow(),
     )
+    try:
+        opik_context.update_current_trace(
+            input={
+                "filename": filename,
+                "kind": kind,
+                "title": truncate(display, 200),
+                "url": truncate(origin, 500) if kind in {"url", "youtube"} else None,
+                "file_bytes": len(file_bytes) if file_bytes else 0,
+                "text_chars": len(text) if text else 0,
+            },
+            metadata={"source_id": source_id},
+        )
+    except Exception:
+        pass
     session.add(source)
     session.commit()
     session.refresh(source)
@@ -124,9 +168,22 @@ async def ingest_upload(
         source.chunk_count = count
         source.status = "ready"
         source.error = None
+        source.updated_at = utcnow()
         session.add(source)
         session.commit()
         session.refresh(source)
+        update_trace(
+            output={
+                "source_id": source_id,
+                "filename": filename,
+                "chunk_count": count,
+                "status": "ready",
+            },
+            metadata={
+                "summary": truncate(summary, 1000),
+                "extracted_chars": len(joined),
+            },
+        )
         return source
     except Exception as exc:
         if upserted:
@@ -137,10 +194,21 @@ async def ingest_upload(
                 await asyncio.to_thread(get_store().delete_source, source_id)
             except Exception:
                 pass
+        if isinstance(exc, TimeoutError):
+            message = "That source took too long to read. Try a shorter video or a smaller file."
+            source.status = "error"
+            source.error = message
+            source.active = False
+            source.updated_at = utcnow()
+            session.add(source)
+            session.commit()
+            session.refresh(source)
+            raise AppError(message, status_code=504, code="ingest_timeout") from exc
         message = exc.message if isinstance(exc, AppError) else safe_error_message(exc)
         source.status = "error"
         source.error = message
         source.active = False
+        source.updated_at = utcnow()
         session.add(source)
         session.commit()
         session.refresh(source)
@@ -168,12 +236,12 @@ async def _extract(
     if kind == "pdf":
         return await asyncio.to_thread(_pdf_pages, file_bytes or b"")
     if kind in {"markdown", "text"}:
-        raw = text if text is not None else (file_bytes or b"").decode("utf-8", errors="replace")
+        raw = text if text is not None else _decode_bytes(file_bytes or b"")
         return [(None, raw)]
     if kind == "url":
         return [(None, await _fetch_article(url or ""))]
     if kind == "youtube":
-        return [(None, await asyncio.to_thread(_youtube_transcript, url or ""))]
+        return [(None, await asyncio.wait_for(asyncio.to_thread(_youtube_transcript, url or ""), timeout=60))]
     if kind == "image":
         from app.gemini_client import get_gemini
 
@@ -225,14 +293,39 @@ def _kind_for_filename(filename: str) -> tuple[str, str | None]:
     raise AppError("Upload a PDF, Markdown, text, image, or audio file.")
 
 
+def _decode_bytes(data: bytes) -> str:
+    """Decode upload bytes, preferring UTF-8 but accepting legacy encodings."""
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    try:
+        import charset_normalizer  # type: ignore
+
+        detected = charset_normalizer.from_bytes(data).best()
+        if detected is not None and detected.encoding:
+            return str(detected)
+    except Exception:
+        pass
+    return data.decode("windows-1252", errors="replace")
+
+
 def _pdf_pages(data: bytes) -> list[tuple[int | None, str]]:
     from pypdf import PdfReader
     import io
 
     reader = PdfReader(io.BytesIO(data))
+    if reader.is_encrypted:
+        raise AppError("That PDF is encrypted. Remove the password and try again.")
+    max_pages = max(1, settings.max_pdf_pages)
     pages: list[tuple[int | None, str]] = []
     for index, page in enumerate(reader.pages, start=1):
-        extracted = page.extract_text() or ""
+        if index > max_pages:
+            break
+        try:
+            extracted = page.extract_text() or ""
+        except Exception:
+            continue
         if extracted.strip():
             pages.append((index, extracted))
     return pages
@@ -240,7 +333,8 @@ def _pdf_pages(data: bytes) -> list[tuple[int | None, str]]:
 
 async def _fetch_article(url: str) -> str:
     """Fetch with per-hop SSRF validation, streaming size cap, and content-type check."""
-    clean = assert_public_http_url(url)
+    # DNS resolution blocks, so every SSRF check runs in a worker thread.
+    clean = await asyncio.to_thread(assert_public_http_url, url)
     headers = {"User-Agent": "EducatorLocal/1.0 (study assistant; local)"}
     current = clean
     async with httpx.AsyncClient(timeout=20, follow_redirects=False, headers=headers) as client:
@@ -249,7 +343,7 @@ async def _fetch_article(url: str) -> str:
         for _ in range(5):
             # Re-validate every hop so an intermediate redirect to a private
             # address is rejected before the request is issued.
-            current = assert_public_http_url(current)
+            current = await asyncio.to_thread(assert_public_http_url, current)
             async with client.stream("GET", current) as response:
                 if response.status_code in (301, 302, 303, 307, 308):
                     location = response.headers.get("location")
@@ -273,7 +367,7 @@ async def _fetch_article(url: str) -> str:
                     chunks.append(piece)
                 html = b"".join(chunks).decode(response.charset_encoding or "utf-8", errors="replace")
                 final_url = str(response.url)
-                assert_public_http_url(final_url)
+                await asyncio.to_thread(assert_public_http_url, final_url)
                 final_response = True
                 break
         if not final_response:
@@ -353,8 +447,11 @@ def _load_transcript(api_cls: type, video_id: str) -> list:
 
 
 def _store_original(source_id: str, filename: str, file_bytes: bytes | None, text: str) -> None:
-    folder = UPLOAD_DIR / source_id
-    folder.mkdir(parents=True, exist_ok=True)
-    if file_bytes:
-        (folder / safe_filename(filename)).write_bytes(file_bytes)
-    (folder / "extracted.txt").write_text(text, encoding="utf-8")
+    try:
+        folder = UPLOAD_DIR / source_id
+        folder.mkdir(parents=True, exist_ok=True)
+        if file_bytes:
+            (folder / safe_filename(filename)).write_bytes(file_bytes)
+        (folder / "extracted.txt").write_text(text, encoding="utf-8")
+    except OSError as exc:
+        raise AppError("The server could not store that source on disk.", status_code=502) from exc

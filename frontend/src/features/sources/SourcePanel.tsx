@@ -1,15 +1,20 @@
 import { useState } from "react";
 import type { FormEvent } from "react";
+import { ACCEPTED_EXTENSIONS, MAX_TITLE_LENGTH } from "../../config";
 import type { CollectionInfo, Source } from "../../types";
+import { checkFile, checkPastedText, checkUrl } from "../../utils/validation";
 
 type Props = {
   sources: Source[];
   collection: CollectionInfo | null;
   busy: boolean;
   highlightedId: string | null;
+  collapsed: boolean;
+  onToggleCollapse: () => void;
   onUpload: (form: FormData) => Promise<void>;
   onToggle: (source: Source, active: boolean) => void;
   onDelete: (source: Source) => void;
+  onError: (message: string) => void;
 };
 
 export function SourcePanel({
@@ -17,9 +22,12 @@ export function SourcePanel({
   collection,
   busy,
   highlightedId,
+  collapsed,
+  onToggleCollapse,
   onUpload,
   onToggle,
   onDelete,
+  onError,
 }: Props) {
   const [url, setUrl] = useState("");
   const [text, setText] = useState("");
@@ -28,129 +36,190 @@ export function SourcePanel({
 
   async function submitUrl(event: FormEvent) {
     event.preventDefault();
+    const problem = checkUrl(url);
+    if (problem) {
+      onError(problem);
+      return;
+    }
     const form = new FormData();
     form.set("url", url.trim());
-    if (title.trim()) form.set("title", title.trim());
+    if (title.trim()) form.set("title", title.trim().slice(0, MAX_TITLE_LENGTH));
     await onUpload(form);
     setUrl("");
   }
 
   async function submitText(event: FormEvent) {
     event.preventDefault();
+    const problem = checkPastedText(text);
+    if (problem) {
+      onError(problem);
+      return;
+    }
     const form = new FormData();
     form.set("text", text);
-    if (title.trim()) form.set("title", title.trim());
+    if (title.trim()) form.set("title", title.trim().slice(0, MAX_TITLE_LENGTH));
     await onUpload(form);
     setText("");
   }
 
+  function submitFile(file: File) {
+    const problem = checkFile(file);
+    if (problem) {
+      onError(problem);
+      return;
+    }
+    const form = new FormData();
+    form.set("file", file);
+    if (title.trim()) form.set("title", title.trim().slice(0, MAX_TITLE_LENGTH));
+    void onUpload(form);
+  }
+
+  if (collapsed) {
+    return (
+      <section className="panel src is-collapsed" aria-label="Sources">
+        <button
+          className="btn-ghost src-expand"
+          type="button"
+          onClick={onToggleCollapse}
+          aria-label="Expand sources"
+          title="Expand sources"
+        >
+          »
+        </button>
+      </section>
+    );
+  }
+
   return (
-    <section className="panel" aria-label="Sources">
-      <div className="panel-head">
-        <div>
+    <section className="panel src" aria-label="Sources">
+      <header className="src-head">
+        <div className="src-heading">
           <h2>Sources</h2>
-          <p>{activeCount} included in answers. Muted sources are left out of retrieval.</p>
+          <p>
+            {activeCount} included in answers. Muted sources are left out of retrieval.
+          </p>
         </div>
-      </div>
-      <div className="scroll stack">
-        <div className="drop">
-          <strong>Add a file</strong>
-          <span>PDF, Markdown, text, image, or audio. Images and audio are transcribed.</span>
-          <input
-            type="file"
-            aria-label="Upload a study file"
-            accept=".pdf,.md,.markdown,.txt,.png,.jpg,.jpeg,.webp,.gif,.wav,.mp3,.m4a,.webm,.ogg,.flac"
-            disabled={busy}
-            onChange={(event) => {
-              const file = event.target.files?.[0];
-              if (!file) return;
-              const form = new FormData();
-              form.set("file", file);
-              if (title.trim()) form.set("title", title.trim());
-              void onUpload(form).finally(() => {
-                event.target.value = "";
-              });
-            }}
-          />
-        </div>
-        <label className="field">
-          Optional title
-          <input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Lecture 4 notes" />
-        </label>
-        <form className="stack" onSubmit={submitUrl}>
-          <label className="field">
-            Web article or YouTube link
+        <button
+          className="btn-ghost src-collapse"
+          type="button"
+          onClick={onToggleCollapse}
+          aria-expanded="true"
+          aria-label="Minimize sources"
+          title="Minimize sources"
+        >
+          «
+        </button>
+      </header>
+
+      <div className="src-body">
+        <div className="src-add">
+          <label className="src-file">
+            <span className="src-file-btn">Choose file</span>
+            <span className="src-file-hint">PDF, Markdown, text, image, or audio</span>
             <input
-              type="url"
-              required
-              value={url}
-              onChange={(event) => setUrl(event.target.value)}
-              placeholder="https://"
+              type="file"
+              aria-label="Upload a study file"
+              accept={ACCEPTED_EXTENSIONS.join(",")}
+              disabled={busy}
+              onChange={(event) => {
+                const file = event.target.files?.[0];
+                if (!file) return;
+                submitFile(file);
+                event.target.value = "";
+              }}
             />
           </label>
-          <button className="btn-ghost" type="submit" disabled={busy || !url.trim()}>
-            Add link
-          </button>
-        </form>
-        <form className="stack" onSubmit={submitText}>
           <label className="field">
-            Paste notes
-            <textarea required value={text} onChange={(event) => setText(event.target.value)} />
+            Optional title
+            <input
+              value={title}
+              maxLength={MAX_TITLE_LENGTH}
+              onChange={(event) => setTitle(event.target.value)}
+              placeholder="Lecture 4 notes"
+            />
           </label>
-          <button className="btn-ghost" type="submit" disabled={busy || !text.trim()}>
-            Add text
-          </button>
-        </form>
-        {sources.length === 0 ? (
-          <div className="empty">
-            <strong>Nothing in the library yet.</strong>
-            <p>Add a source, then leave it checked if you want the tutor to use it.</p>
-          </div>
-        ) : (
-          sources.map((source) => (
-            <article
-              key={source.id}
-              className={`source${source.active ? " active" : ""}${highlightedId === source.id ? " highlight" : ""}`}
-            >
-              <div className="source-top">
-                <span className={`badge ${source.status}`}>{source.kind}</span>
-                <label className="check">
-                  <input
-                    type="checkbox"
-                    checked={source.active}
-                    disabled={source.status !== "ready"}
-                    onChange={(event) => onToggle(source, event.target.checked)}
-                  />
-                  Include
-                </label>
-              </div>
-              <h3>{source.title}</h3>
-              <div className="meta">
-                {source.status === "ready"
-                  ? `${source.chunkCount} chunks`
-                  : source.status === "error"
-                    ? source.error
-                    : "Reading…"}
-              </div>
-              {source.summary ? <p className="summary">{source.summary}</p> : null}
-              <div className="source-actions">
-                <span className="meta">{source.filename}</span>
-                <button className="btn-danger" type="button" onClick={() => onDelete(source)}>
-                  Delete
-                </button>
-              </div>
-            </article>
-          ))
-        )}
-        <details className="details">
-          <summary>How retrieval is scoped</summary>
-          <p>
-            One collection{collection ? ` (${collection.name}, ${collection.points} points)` : ""}. Each source is
-            isolated by sourceId. Answers search only the checked sources, using a $in filter. An empty selection
-            retrieves nothing. Embeddings are local ({collection?.embeddingModel ?? "BAAI/bge-small-en-v1.5"}), with
-            binary quantization and on-disk payloads.
-          </p>
-        </details>
+          <form className="src-form" onSubmit={submitUrl}>
+            <label className="field">
+              Web article or YouTube link
+              <input
+                type="url"
+                required
+                value={url}
+                onChange={(event) => setUrl(event.target.value)}
+                placeholder="https://"
+              />
+            </label>
+            <button className="btn-ghost" type="submit" disabled={busy || !url.trim()}>
+              Add link
+            </button>
+          </form>
+          <form className="src-form" onSubmit={submitText}>
+            <label className="field">
+              Paste notes
+              <textarea required value={text} onChange={(event) => setText(event.target.value)} />
+            </label>
+            <button className="btn-ghost" type="submit" disabled={busy || !text.trim()}>
+              Add text
+            </button>
+          </form>
+        </div>
+
+        <div className="src-list" role="list">
+          {sources.length === 0 ? (
+            <div className="empty">
+              <strong>Nothing in the library yet.</strong>
+              <p>Add a source, then leave it checked if you want the tutor to use it.</p>
+            </div>
+          ) : (
+            sources.map((source) => (
+              <article
+                key={source.id}
+                role="listitem"
+                className={`src-card${source.active ? " is-active" : ""}${highlightedId === source.id ? " is-highlight" : ""}`}
+              >
+                <div className="src-card-top">
+                  <span className={`badge ${source.status}`}>{source.kind}</span>
+                  <label className="check">
+                    <input
+                      type="checkbox"
+                      checked={source.active}
+                      disabled={source.status !== "ready"}
+                      onChange={(event) => onToggle(source, event.target.checked)}
+                    />
+                    Include
+                  </label>
+                </div>
+                <h3 className="src-name">{source.title}</h3>
+                <div className="src-meta">
+                  {source.status === "ready"
+                    ? `${source.chunkCount} chunks`
+                    : source.status === "error"
+                      ? source.error || "Could not read this source."
+                      : "Reading…"}
+                </div>
+                {source.summary ? <p className="src-summary">{source.summary}</p> : null}
+                <div className="src-foot">
+                  <span className="src-file-name">{source.filename}</span>
+                  <button className="btn-danger src-delete" type="button" onClick={() => onDelete(source)}>
+                    Delete
+                  </button>
+                </div>
+              </article>
+            ))
+          )}
+        </div>
+
+        <footer className="src-foot-note">
+          <details className="details">
+            <summary>How retrieval is scoped</summary>
+            <p>
+              One collection{collection ? ` (${collection.name}, ${collection.points} points)` : ""}. Each source is
+              isolated by sourceId. Answers search only the checked sources, using a $in filter. An empty selection
+              retrieves nothing. Embeddings are local ({collection?.embeddingModel ?? "BAAI/bge-small-en-v1.5"}), with
+              binary quantization and on-disk payloads.
+            </p>
+          </details>
+        </footer>
       </div>
     </section>
   );

@@ -15,17 +15,18 @@ class Source(SQLModel, table=True):
     __tablename__ = "sources"
 
     id: str = Field(primary_key=True)
-    filename: str
+    filename: str = Field(index=True)
     title: str
-    kind: str
+    kind: str = Field(index=True)
     origin: str = ""
     summary: str = ""
     chunk_count: int = 0
     active: bool = True
-    status: str = "processing"
+    status: str = Field(default="processing", index=True)
     error: str | None = None
     mime_type: str | None = None
-    created_at: datetime = Field(default_factory=utcnow)
+    created_at: datetime = Field(default_factory=utcnow, index=True)
+    updated_at: datetime = Field(default_factory=utcnow)
 
 
 class ChatSession(SQLModel, table=True):
@@ -41,8 +42,8 @@ class Message(SQLModel, table=True):
     __tablename__ = "messages"
 
     id: str = Field(primary_key=True)
-    session_id: str = Field(index=True, foreign_key="chat_sessions.id")
-    role: str
+    session_id: str = Field(index=True, foreign_key="chat_sessions.id", ondelete="CASCADE")
+    role: str = Field(index=True)
     content: str
     citations_json: str = "[]"
     trace_json: str = "[]"
@@ -55,7 +56,7 @@ class Artifact(SQLModel, table=True):
 
     id: str = Field(primary_key=True)
     session_id: str | None = Field(default=None, index=True)
-    kind: str
+    kind: str = Field(index=True)
     title: str = ""
     payload_json: str
     created_at: datetime = Field(default_factory=utcnow)

@@ -13,6 +13,7 @@ and are fetched once with `python scripts/download_model.py` after
 
 from __future__ import annotations
 
+import logging
 import threading
 import uuid
 from dataclasses import dataclass
@@ -37,9 +38,13 @@ from qdrant_client.models import (
 
 from app.config import QDRANT_DIR, settings
 
+from opik import track
+
 COLLECTION = settings.collection_name
 EMBEDDING_MODEL = settings.embedding_model
 VECTOR_SIZE = 384
+
+logger = logging.getLogger("educator.vectorstore")
 
 
 @dataclass(frozen=True)
@@ -135,9 +140,10 @@ class VectorStore:
                 field_name="sourceId",
                 field_schema=PayloadSchemaType.KEYWORD,
             )
-        except Exception:
+        except Exception as exc:
             # The index already exists after the first startup.
             # Local Qdrant also ignores payload indexes; filtering still works.
+            logger.debug("Payload index creation skipped: %s", type(exc).__name__)
             return
 
     def upsert_chunks(
@@ -147,36 +153,7 @@ class VectorStore:
         filename: str,
         chunks: list[Any],
     ) -> int:
-        if not chunks:
-            return 0
-        documents = [chunk.text for chunk in chunks]
-        vectors = _embed_texts(documents)
-        created = datetime.now(timezone.utc).isoformat()
-        points = []
-        for chunk, vector in zip(chunks, vectors):
-            # chunkId must be globally unique: citations only carry
-            # (filename, chunkId), so two different "notes.txt" files must
-            # never produce the same chunkId. Use the full source uuid.
-            chunk_id = f"{source_id}-c{chunk.chunk_index}"
-            points.append(
-                PointStruct(
-                    id=str(uuid.uuid4()),
-                    vector=vector,
-                    payload={
-                        "sourceId": source_id,
-                        "filename": filename,
-                        "pageNumber": chunk.page_number,
-                        "chunkIndex": chunk.chunk_index,
-                        "chunkId": chunk_id,
-                        "createdTime": created,
-                        "text": chunk.text,
-                    },
-                )
-            )
-        with self._lock:
-            self._ensure_collection_locked()
-            self.client.upsert(collection_name=self.collection, points=points)
-        return len(chunks)
+        return _upsert_span(self, source_id=source_id, filename=filename, chunks=chunks)
 
     def delete_source(self, source_id: str) -> None:
         with self._lock:
@@ -198,46 +175,10 @@ class VectorStore:
 
     def search(self, query: str, source_ids: list[str], limit: int | None = None) -> list[Hit]:
         """Empty selection retrieves nothing. The $in filter is mandatory."""
-        ids = [item for item in source_ids if item]
-        if not ids or not query.strip():
-            return []
-        cap = limit or settings.retrieval_limit
-        query_vector = _embed_texts([query.strip()])[0]
-        with self._lock:
-            if not self.client.collection_exists(self.collection):
-                return []
-            response = self.client.query_points(
-                collection_name=self.collection,
-                query=query_vector,
-                query_filter=source_in_filter(ids),
-                limit=cap,
-                with_payload=True,
-            )
-            points = list(response.points)
-        hits = [_hit_from_point(point) for point in points]
-        return [hit for hit in hits if hit is not None and hit.source_id in set(ids)]
+        return _search_span(self, query, list(source_ids or []), limit)
 
     def sample(self, source_ids: list[str], limit: int = 8) -> list[Hit]:
-        ids = [item for item in source_ids if item]
-        if not ids:
-            return []
-        with self._lock:
-            if not self.client.collection_exists(self.collection):
-                return []
-            records, _ = self.client.scroll(
-                collection_name=self.collection,
-                scroll_filter=source_in_filter(ids),
-                limit=limit,
-                with_payload=True,
-            )
-        hits = []
-        allowed = set(ids)
-        for record in records:
-            hit = _hit_from_payload(getattr(record, "payload", None) or {}, score=0.0)
-            if hit and hit.source_id in allowed:
-                hits.append(hit)
-        hits.sort(key=lambda item: (item.source_id, item.chunk_index))
-        return hits
+        return _sample_span(self, list(source_ids or []), max(1, min(int(limit or 8), 64)))
 
     def count(self) -> int:
         with self._lock:
@@ -251,6 +192,123 @@ def _hit_from_point(point: Any) -> Hit | None:
     payload = getattr(point, "payload", None) or {}
     score = float(getattr(point, "score", 0.0) or 0.0)
     return _hit_from_payload(payload, score)
+
+
+@track(name="qdrant_upsert", type="tool", ignore_arguments=["store", "chunks"])
+def _upsert_span(store: VectorStore, *, source_id: str, filename: str, chunks: list[Any]) -> int:
+    from app.observability import update_span
+
+    if not chunks:
+        update_span(output={"chunk_count": 0})
+        return 0
+    documents = [chunk.text for chunk in chunks]
+    vectors = _embed_texts(documents)
+    if vectors and len(vectors[0]) != VECTOR_SIZE:
+        logger.warning(
+            "Embedding dimension %s does not match collection size %s; recreate the collection",
+            len(vectors[0]),
+            VECTOR_SIZE,
+        )
+    created = datetime.now(timezone.utc).isoformat()
+    points = []
+    for chunk, vector in zip(chunks, vectors):
+        # chunkId must be globally unique: citations only carry
+        # (filename, chunkId), so two different "notes.txt" files must
+        # never produce the same chunkId. Use the full source uuid.
+        chunk_id = f"{source_id}-c{chunk.chunk_index}"
+        points.append(
+            PointStruct(
+                id=str(uuid.uuid4()),
+                vector=vector,
+                payload={
+                    "sourceId": source_id,
+                    "filename": filename,
+                    "pageNumber": chunk.page_number,
+                    "chunkIndex": chunk.chunk_index,
+                    "chunkId": chunk_id,
+                    "createdTime": created,
+                    "text": chunk.text,
+                },
+            )
+        )
+    with store._lock:
+        store._ensure_collection_locked()
+        store.client.upsert(collection_name=store.collection, points=points)
+    update_span(
+        input={"source_id": source_id, "filename": filename, "chunk_count": len(chunks)},
+        output={"upserted": len(chunks)},
+    )
+    return len(chunks)
+
+
+@track(name="qdrant_search", type="tool", ignore_arguments=["store"])
+def _search_span(store: VectorStore, query: str, source_ids: list[str], limit: int | None) -> list[Hit]:
+    """Qdrant $in search. Logs query, $in ids, and chunk previews as a Span."""
+    from app.observability import chunk_preview, truncate, update_span
+
+    ids = [item for item in source_ids if item]
+    if not ids or not query.strip():
+        update_span(
+            input={"query": truncate(query, 1000), "source_ids": ids},
+            output={"hit_count": 0, "empty": True},
+        )
+        return []
+    cap = limit or settings.retrieval_limit
+    cap = max(1, min(int(cap), 20))
+    query_vector = _embed_texts([query.strip()])[0]
+    with store._lock:
+        if not store.client.collection_exists(store.collection):
+            update_span(output={"hit_count": 0, "no_collection": True})
+            return []
+        response = store.client.query_points(
+            collection_name=store.collection,
+            query=query_vector,
+            query_filter=source_in_filter(ids),
+            limit=cap,
+            with_payload=True,
+        )
+        points = list(response.points)
+    hits = [_hit_from_point(point) for point in points]
+    hits = [hit for hit in hits if hit is not None and hit.source_id in set(ids)]
+    update_span(
+        input={"query": truncate(query, 1000), "source_ids": ids, "limit": cap},
+        output={"hit_count": len(hits)},
+        metadata={"chunks": chunk_preview(hits)},
+    )
+    return hits
+
+
+@track(name="qdrant_sample", type="tool", ignore_arguments=["store"])
+def _sample_span(store: VectorStore, source_ids: list[str], limit: int) -> list[Hit]:
+    from app.observability import chunk_preview, update_span
+
+    ids = [item for item in source_ids if item]
+    if not ids:
+        update_span(output={"hit_count": 0, "empty": True})
+        return []
+    with store._lock:
+        if not store.client.collection_exists(store.collection):
+            update_span(output={"hit_count": 0, "no_collection": True})
+            return []
+        records, _ = store.client.scroll(
+            collection_name=store.collection,
+            scroll_filter=source_in_filter(ids),
+            limit=limit,
+            with_payload=True,
+        )
+    hits: list[Hit] = []
+    allowed = set(ids)
+    for record in records:
+        hit = _hit_from_payload(getattr(record, "payload", None) or {}, score=0.0)
+        if hit and hit.source_id in allowed:
+            hits.append(hit)
+    hits.sort(key=lambda item: (item.source_id, item.chunk_index))
+    update_span(
+        input={"source_ids": ids, "limit": limit},
+        output={"hit_count": len(hits)},
+        metadata={"chunks": chunk_preview(hits)},
+    )
+    return hits
 
 
 def _hit_from_payload(payload: dict[str, Any], score: float) -> Hit | None:

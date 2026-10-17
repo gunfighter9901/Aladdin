@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 
@@ -24,7 +25,16 @@ async def chat(body: ChatRequest) -> ChatResponse:
 @router.post("/chat/stream")
 async def chat_stream(body: ChatRequest) -> StreamingResponse:
     async def events() -> AsyncIterator[str]:
-        async for item in run_turn(body.sessionId, body.message, body.activeSourceIds):
+        iterator = run_turn(body.sessionId, body.message, body.activeSourceIds).__aiter__()
+        while True:
+            try:
+                item = await asyncio.wait_for(iterator.__anext__(), timeout=20.0)
+            except StopAsyncIteration:
+                break
+            except TimeoutError:
+                # SSE heartbeat so proxies do not kill an idle ReAct turn.
+                yield ": ping\n\n"
+                continue
             payload = json.dumps(item["data"], default=str)
             yield f"event: {item['event']}\ndata: {payload}\n\n"
 

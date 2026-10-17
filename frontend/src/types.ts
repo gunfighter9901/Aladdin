@@ -1,3 +1,5 @@
+export type SourceStatus = "processing" | "ready" | "error" | string;
+
 export type Source = {
   id: string;
   filename: string;
@@ -7,7 +9,7 @@ export type Source = {
   summary: string;
   chunkCount: number;
   active: boolean;
-  status: string;
+  status: SourceStatus;
   error: string | null;
   createdAt: string;
 };
@@ -61,6 +63,8 @@ export type QuizPayload = {
   title: string;
   questions: QuizQuestion[];
   flashcards: Flashcard[];
+  requestedCount?: number;
+  returnedCount?: number;
 };
 
 export type PodcastTurn = {
@@ -77,11 +81,12 @@ export type PodcastPayload = {
   sampleRateHz: number;
   voices?: { Joe: string; Jane: string };
   audioError?: string | null;
+  truncated?: boolean;
 };
 
 export type InfographicPayload = {
   title: string;
-  diagramType: string;
+  diagramType: DiagramType;
   mermaid: string;
 };
 
@@ -93,7 +98,7 @@ export type Artifacts = {
 
 export type ChatMessage = {
   id: string;
-  role: string;
+  role: "user" | "assistant" | string;
   content: string;
   citations: Citation[];
   trace: TraceStep[];

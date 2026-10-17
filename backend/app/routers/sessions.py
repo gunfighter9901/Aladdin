@@ -5,8 +5,8 @@ from __future__ import annotations
 import inspect
 import uuid
 
-from fastapi import APIRouter, Depends, Response
-from sqlmodel import Session, select
+from fastapi import APIRouter, Depends, Query, Response
+from sqlmodel import Session, delete, select
 
 from app.agent import APP_NAME, USER_ID, runtime
 from app.database import get_session
@@ -19,8 +19,14 @@ router = APIRouter(prefix="/api", tags=["sessions"])
 
 
 @router.get("/sessions", response_model=list[SessionOut])
-def list_sessions(db: Session = Depends(get_session)) -> list[SessionOut]:
-    rows = db.exec(select(ChatSession).order_by(ChatSession.updated_at.desc())).all()
+def list_sessions(
+    db: Session = Depends(get_session),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> list[SessionOut]:
+    rows = db.exec(
+        select(ChatSession).order_by(ChatSession.updated_at.desc()).limit(limit).offset(offset)
+    ).all()
     return [session_out(row) for row in rows]
 
 
@@ -39,6 +45,7 @@ async def create_or_switch_session(
         db.refresh(existing)
         return session_out(existing)
     title = (body.title.strip() if body and body.title else "") or "New study session"
+    title = " ".join(title.split())[:120] or "New study session"
     chat = ChatSession(id=str(uuid.uuid4()), title=title[:120], created_at=utcnow(), updated_at=utcnow())
     db.add(chat)
     db.commit()
@@ -48,12 +55,19 @@ async def create_or_switch_session(
 
 
 @router.get("/sessions/{session_id}", response_model=SessionDetail)
-def get_session_detail(session_id: str, db: Session = Depends(get_session)) -> SessionDetail:
+def get_session_detail(
+    session_id: str,
+    db: Session = Depends(get_session),
+    message_limit: int = Query(default=200, ge=1, le=1000),
+) -> SessionDetail:
     chat = db.get(ChatSession, session_id)
     if chat is None:
         raise AppError("That study session was not found.", status_code=404)
     messages = db.exec(
-        select(Message).where(Message.session_id == session_id).order_by(Message.created_at)
+        select(Message)
+        .where(Message.session_id == session_id)
+        .order_by(Message.created_at)
+        .limit(message_limit)
     ).all()
     artifacts = db.exec(
         select(Artifact).where(Artifact.session_id == session_id).order_by(Artifact.created_at)
@@ -70,10 +84,8 @@ async def delete_session(session_id: str, db: Session = Depends(get_session)) ->
     chat = db.get(ChatSession, session_id)
     if chat is None:
         raise AppError("That study session was not found.", status_code=404)
-    for message in db.exec(select(Message).where(Message.session_id == session_id)).all():
-        db.delete(message)
-    for artifact in db.exec(select(Artifact).where(Artifact.session_id == session_id)).all():
-        db.delete(artifact)
+    db.exec(delete(Message).where(Message.session_id == session_id))
+    db.exec(delete(Artifact).where(Artifact.session_id == session_id))
     db.delete(chat)
     db.commit()
     await _delete_adk_session(session_id)

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import mermaid from "mermaid";
+import { MAX_FOCUS_LENGTH } from "../../config";
 import type { Artifacts, DiagramType, InfographicPayload, PodcastPayload, QuizPayload } from "../../types";
 
 type Kind = "podcast" | "quiz" | "infographic";
@@ -33,7 +33,7 @@ export function StudioPanel({ artifacts, busy, canGenerate, onGenerate }: Props)
       <div className="panel-head">
         <div>
           <h2>Studio</h2>
-          <p>Podcasts, active recall, and diagrams from the checked sources only.</p>
+          <p>Podcasts, Quiz, and diagrams from the checked sources only.</p>
         </div>
       </div>
       <div className="tabs" role="tablist">
@@ -54,6 +54,7 @@ export function StudioPanel({ artifacts, busy, canGenerate, onGenerate }: Props)
           Focus
           <input
             value={focus}
+            maxLength={MAX_FOCUS_LENGTH}
             onChange={(event) => setFocus(event.target.value)}
             placeholder="Optional, such as the water cycle"
           />
@@ -109,11 +110,20 @@ function PodcastView({ podcast }: { podcast?: PodcastPayload }) {
       setObjectUrl("");
       return;
     }
+    // Guard the main thread: refuse absurd payloads instead of locking the tab in atob().
+    if (podcast.audioBase64.length > 40_000_000) {
+      setObjectUrl("");
+      return;
+    }
     let url = "";
     try {
       const binary = atob(podcast.audioBase64);
       const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      const step = 8192;
+      for (let offset = 0; offset < binary.length; offset += step) {
+        const end = Math.min(offset + step, binary.length);
+        for (let i = offset; i < end; i++) bytes[i] = binary.charCodeAt(i);
+      }
       const blob = new Blob([bytes.buffer as ArrayBuffer], { type: podcast.mimeType || "audio/wav" });
       url = URL.createObjectURL(blob);
       setObjectUrl(url);
@@ -138,6 +148,9 @@ function PodcastView({ podcast }: { podcast?: PodcastPayload }) {
   return (
     <div className="stack">
       <strong>{podcast.title}</strong>
+      {podcast.truncated ? (
+        <p className="hint">Long scripts are cut at a turn boundary so speech synthesis stays reliable.</p>
+      ) : null}
       {src ? <audio controls src={src} /> : <p className="hint">{podcast.audioError || "Script is ready. Audio was not returned."}</p>}
       {src ? (
         <a className="btn-ghost" href={src} download={downloadName} style={{ textAlign: "center" }}>
@@ -185,6 +198,11 @@ function QuizView({ quiz }: { quiz?: QuizPayload }) {
   return (
     <div className="stack">
       <strong>{quiz.title}</strong>
+      {typeof quiz.requestedCount === "number" && typeof quiz.returnedCount === "number" && quiz.returnedCount < quiz.requestedCount ? (
+        <p className="hint">
+          {quiz.returnedCount} of {quiz.requestedCount} requested questions were usable.
+        </p>
+      ) : null}
       {Object.keys(revealed).length > 0 ? (
         <div className="score">
           {correct} / {quiz.questions.length} correct so far
@@ -255,17 +273,47 @@ function QuizView({ quiz }: { quiz?: QuizPayload }) {
           </button>
         </div>
       ) : null}
+      <QuizDownload quiz={quiz} />
     </div>
+  );
+}
+
+function QuizDownload({ quiz }: { quiz: QuizPayload }) {
+  const [downloadUrl, setDownloadUrl] = useState("");
+  useEffect(() => {
+    const body = quiz.questions
+      .map(
+        (question, index) =>
+          `${index + 1}. ${question.question}\n${question.options.map((option) => `   - ${option}`).join("\n")}\n   Answer: ${question.correctAnswer}\n   Why: ${question.rationale}`,
+      )
+      .join("\n\n");
+    const url = URL.createObjectURL(new Blob([`${quiz.title}\n\n${body}`], { type: "text/plain" }));
+    setDownloadUrl(url);
+    return () => URL.revokeObjectURL(url);
+  }, [quiz]);
+  return (
+    <a
+      className="btn-ghost"
+      style={{ textAlign: "center" }}
+      href={downloadUrl}
+      download={`${(quiz.title || "quiz").replace(/[^\w\- ]+/g, "").trim() || "quiz"}.txt`}
+    >
+      Download quiz
+    </a>
   );
 }
 
 let mermaidInitialized = false;
 
-function ensureMermaid() {
+async function renderMermaid(id: string, markup: string): Promise<string> {
+  // Lazy-load the heaviest dependency only when a diagram actually renders.
+  const { default: mermaid } = await import("mermaid");
   if (!mermaidInitialized) {
-    mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: "neutral" });
+    mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: "dark" });
     mermaidInitialized = true;
   }
+  const result = await mermaid.render(id, markup);
+  return result.svg;
 }
 
 function DiagramView({ diagram }: { diagram?: InfographicPayload }) {
@@ -279,14 +327,18 @@ function DiagramView({ diagram }: { diagram?: InfographicPayload }) {
       setError("");
       return;
     }
+    // Cap markup so a pathological response cannot hang the renderer.
+    if (diagram.mermaid.length > 20000) {
+      setSvg("");
+      setError("This diagram is too large to draw. The markup is below.");
+      return;
+    }
     let cancelled = false;
-    ensureMermaid();
     const id = `diagram-${Math.random().toString(36).slice(2)}`;
-    mermaid
-      .render(id, diagram.mermaid)
-      .then((result) => {
+    renderMermaid(id, diagram.mermaid)
+      .then((rendered) => {
         if (!cancelled) {
-          setSvg(result.svg);
+          setSvg(rendered);
           setError("");
         }
       })
@@ -313,11 +365,32 @@ function DiagramView({ diagram }: { diagram?: InfographicPayload }) {
     <div className="stack">
       <strong>{diagram.title}</strong>
       {error ? <p className="hint">{error}</p> : null}
+      {/* Mermaid renders with securityLevel "strict", which sanitizes the SVG. */}
       {svg ? <div className="diagram" dangerouslySetInnerHTML={{ __html: svg }} /> : null}
       <button className="btn-ghost" type="button" onClick={() => setShowCode((value) => !value)}>
         {showCode ? "Hide markup" : "Show markup"}
       </button>
       {showCode || error ? <pre className="code">{diagram.mermaid}</pre> : null}
+      <DiagramDownload diagram={diagram} />
     </div>
+  );
+}
+
+function DiagramDownload({ diagram }: { diagram: InfographicPayload }) {
+  const [downloadUrl, setDownloadUrl] = useState("");
+  useEffect(() => {
+    const url = URL.createObjectURL(new Blob([diagram.mermaid], { type: "text/plain" }));
+    setDownloadUrl(url);
+    return () => URL.revokeObjectURL(url);
+  }, [diagram]);
+  return (
+    <a
+      className="btn-ghost"
+      style={{ textAlign: "center" }}
+      href={downloadUrl}
+      download={`${(diagram.title || "diagram").replace(/[^\w\- ]+/g, "").trim() || "diagram"}.mmd`}
+    >
+      Download markup
+    </a>
   );
 }

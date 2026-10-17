@@ -11,6 +11,7 @@ _KEY_PATTERNS = (
     re.compile(r"AIza[0-9A-Za-z\-_]{10,}"),
     re.compile(r"(?i)(api[_-]?key|authorization|bearer|token|secret)\s*[=:]\s*\S+"),
     re.compile(r"(?i)(opik|gemini|google)[_-]?[a-z0-9]*key\s*[=:]\s*\S+"),
+    re.compile(r"(?i)([?&](?:key|api[_-]?key|token)=)[^&\s]+"),
 )
 
 
@@ -46,11 +47,27 @@ def safe_error_message(exc: BaseException, limit: int = 400) -> str:
 def safe_filename(name: str) -> str:
     base = (name or "upload").replace("\\", "/").split("/")[-1]
     cleaned = re.sub(r"[^A-Za-z0-9._\- ]+", "_", base).strip("._ ")
-    return (cleaned or "upload")[:180]
+    if not cleaned:
+        return "upload"
+    # Preserve a short extension when truncation would otherwise drop it.
+    if len(cleaned) > 180:
+        stem, dot, ext = cleaned.rpartition(".")
+        if dot and 1 <= len(ext) <= 8 and ext.replace(" ", "").isalnum():
+            budget = 179 - len(ext)
+            stem = stem[:budget].rstrip("._ ") or "upload"
+            return f"{stem}.{ext}"
+        return cleaned[:180].rstrip("._ ") or "upload"
+    return cleaned
 
 
 def assert_public_http_url(url: str) -> str:
-    """Reject non-http schemes and hosts that resolve to private networks."""
+    """Reject non-http schemes and hosts that resolve to private networks.
+
+    DNS resolution is blocking, so callers on the async path should use
+    ``await asyncio.to_thread(assert_public_http_url, url)``. The check is a
+    best-effort guard for an internal tool, not a sandbox boundary: DNS can
+    change between this check and the outbound request.
+    """
     parsed = urlparse((url or "").strip())
     if parsed.scheme not in {"http", "https"}:
         raise ValueError("Only public http and https URLs are allowed.")

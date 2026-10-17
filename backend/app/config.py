@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
-from pydantic import Field
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     app_host: str = Field(default="127.0.0.1", validation_alias="APP_HOST")
     app_port: int = Field(default=8000, validation_alias="APP_PORT")
 
-    reasoning_model: str = "gemini-3.1-flash-lite"
+    reasoning_model: str = "gemini-3.5-flash-lite"
     tts_model: str = "gemini-3.1-flash-tts-preview"
     embedding_model: str = "BAAI/bge-small-en-v1.5"
 
@@ -51,14 +51,55 @@ class Settings(BaseSettings):
     chunk_tokens: int = 480
     chunk_overlap: int = 64
     retrieval_limit: int = 6
+    max_chunks_per_source: int = 2000
+    max_pdf_pages: int = 500
 
     sqlite_path: Path = DATA_DIR / "educator.db"
     adk_sqlite_path: Path = DATA_DIR / "adk_sessions.db"
 
     max_upload_bytes: int = 25 * 1024 * 1024
+    max_sources_per_query: int = 64
+    chat_timeout_s: float = 300.0
+    gemini_timeout_s: float = 90.0
+
+    cors_origins: str = Field(default="http://127.0.0.1:5173,http://localhost:5173", validation_alias="CORS_ORIGINS")
+    log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")
+
+    def cors_origin_list(self) -> list[str]:
+        return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+
+    def log_level_name(self) -> str:
+        return (self.log_level or "INFO").strip().upper()
 
     def gemini_configured(self) -> bool:
         return bool(self.gemini_api_key.strip() or os.environ.get("GOOGLE_API_KEY", "").strip())
+
+    @field_validator("chunk_tokens")
+    @classmethod
+    def _check_chunk_tokens(cls, value: int) -> int:
+        if not 64 <= value <= 500:
+            raise ValueError("chunk_tokens must be between 64 and 500")
+        return value
+
+    @field_validator("retrieval_limit")
+    @classmethod
+    def _check_retrieval_limit(cls, value: int) -> int:
+        if not 1 <= value <= 20:
+            raise ValueError("retrieval_limit must be between 1 and 20")
+        return value
+
+    @field_validator("app_port")
+    @classmethod
+    def _check_port(cls, value: int) -> int:
+        if not 1 <= value <= 65535:
+            raise ValueError("APP_PORT must be between 1 and 65535")
+        return value
+
+    @model_validator(mode="after")
+    def _check_overlap(self) -> Settings:
+        if self.chunk_overlap < 0 or self.chunk_overlap >= self.chunk_tokens:
+            raise ValueError("chunk_overlap must be >= 0 and smaller than chunk_tokens")
+        return self
 
     def opik_configured(self) -> bool:
         return bool(self.opik_api_key.strip() or self.opik_url_override.strip())
