@@ -1,4 +1,5 @@
-# Educator
+# Aladdin - Educator in your local machine  
+<img width="60%" alt="Aladdin_educator" src="https://github.com/user-attachments/assets/9a200a04-fc69-4908-95bd-bb7a35e14b10" />
 
 A local study assistant. It turns PDFs, notes, web articles, YouTube transcripts, images, and audio into a cited tutor, plus podcasts, quizzes, and diagrams.
 
