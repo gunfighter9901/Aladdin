@@ -1,6 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  ApiError,
   createSession,
   deleteSession,
   deleteSource,
@@ -29,6 +28,7 @@ import type {
   StudySession,
   TraceStep,
 } from "./types";
+import { artifactsFromSession, messageFrom } from "./utils/messages";
 
 export function App() {
   const [health, setHealth] = useState<Health | null>(null);
@@ -47,9 +47,17 @@ export function App() {
   const [studioBusy, setStudioBusy] = useState<"podcast" | "quiz" | "infographic" | null>(null);
   const [highlightedId, setHighlightedId] = useState<string | null>(null);
   const [sourcesCollapsed, setSourcesCollapsed] = useState(false);
+  const [confirm, setConfirm] = useState<{ title: string; detail: string; action: () => void } | null>(null);
   const sessionIdRef = useRef<string | null>(null);
   const openRequestRef = useRef(0);
   const chatAbortRef = useRef<AbortController | null>(null);
+
+  const readySources = useMemo(
+    () => sources.filter((source) => source.active && source.status === "ready"),
+    [sources],
+  );
+  const readyCount = readySources.length;
+  const readyIds = useMemo(() => readySources.map((source) => source.id), [readySources]);
 
   useEffect(() => {
     sessionIdRef.current = sessionId;
@@ -152,13 +160,21 @@ export function App() {
   }
 
   async function onDelete(source: Source) {
-    if (!window.confirm(`Delete ${source.title}? Its passages will leave the collection.`)) return;
-    try {
-      await deleteSource(source.id);
-      await refreshSources();
-    } catch (error) {
-      setBanner(messageFrom(error, "Could not delete that source."));
-    }
+    setConfirm({
+      title: `Delete ${source.title}?`,
+      detail: "Its passages will leave the collection.",
+      action: () => {
+        setConfirm(null);
+        void (async () => {
+          try {
+            await deleteSource(source.id);
+            await refreshSources();
+          } catch (error) {
+            setBanner(messageFrom(error, "Could not delete that source."));
+          }
+        })();
+      },
+    });
   }
 
   async function onNewSession() {
@@ -176,17 +192,25 @@ export function App() {
 
   async function onDeleteSession() {
     if (!sessionId) return;
-    if (!window.confirm("Delete this study session?")) return;
-    try {
-      await deleteSession(sessionId);
-      const remaining = sessions.filter((item) => item.id !== sessionId);
-      setSessions(remaining);
-      const next = remaining[0];
-      if (next) await openSession(next.id);
-      else await onNewSession();
-    } catch (error) {
-      setBanner(messageFrom(error, "Could not delete that session."));
-    }
+    setConfirm({
+      title: "Delete this study session?",
+      detail: "Messages and linked studio artifacts will be removed.",
+      action: () => {
+        setConfirm(null);
+        void (async () => {
+          try {
+            await deleteSession(sessionId);
+            const remaining = sessions.filter((item) => item.id !== sessionId);
+            setSessions(remaining);
+            const next = remaining[0];
+            if (next) await openSession(next.id);
+            else await onNewSession();
+          } catch (error) {
+            setBanner(messageFrom(error, "Could not delete that session."));
+          }
+        })();
+      },
+    });
   }
 
   async function onSend(text: string) {
@@ -196,12 +220,12 @@ export function App() {
     const controller = new AbortController();
     chatAbortRef.current = controller;
     const sendSessionId = sessionId;
+    const activeSourceIds = [...readyIds];
     setBanner(null);
     setAsking(true);
     setStatus("The tutor is reading the selected sources.");
     setLiveText("");
     setLiveTrace([]);
-    const activeSourceIds = sources.filter((source) => source.active && source.status === "ready").map((source) => source.id);
     const optimisticId = `local-${Date.now()}`;
     const optimistic: ChatMessage = {
       id: optimisticId,
@@ -214,6 +238,7 @@ export function App() {
     };
     setMessages((current) => [...current, optimistic]);
     let completed = false;
+    let sawErrorEvent = false;
     try {
       await streamChat({ sessionId: sendSessionId, message: text, activeSourceIds }, (event) => {
         // The user may have switched sessions mid-stream; never append a
@@ -226,7 +251,10 @@ export function App() {
         if (event.event === "status") setStatus(event.data.text);
         if (event.event === "trace") setLiveTrace((current) => [...current, event.data]);
         if (event.event === "token") setLiveText((current) => current + event.data.text);
-        if (event.event === "error") setBanner(event.data.message);
+        if (event.event === "error") {
+          sawErrorEvent = true;
+          setBanner(event.data.message);
+        }
         if (event.event === "done") {
           completed = true;
           setAsking(false);
@@ -254,7 +282,11 @@ export function App() {
       if (!completed) {
         setMessages((current) => current.filter((item) => item.id !== optimisticId));
       }
-      setBanner(messageFrom(error, "The tutor could not answer."));
+      // Stream-level error events already set the banner; only fall back here
+      // for transport failures. Never show the raw ApiError object.
+      if (!sawErrorEvent) {
+        setBanner(messageFrom(error, "The tutor could not answer."));
+      }
     } finally {
       if (sessionIdRef.current === sendSessionId) {
         setAsking(false);
@@ -271,7 +303,7 @@ export function App() {
     diagramType: DiagramType,
     count: number,
   ) {
-    const sourceIds = sources.filter((source) => source.active && source.status === "ready").map((source) => source.id);
+    const sourceIds = [...readyIds];
     if (!sourceIds.length) {
       setBanner("Select at least one source. An empty selection retrieves nothing.");
       return;
@@ -301,10 +333,30 @@ export function App() {
     }
   }
 
-  const readyCount = sources.filter((source) => source.active && source.status === "ready").length;
-
   return (
     <div className="app">
+      {confirm ? (
+        <div className="confirm-backdrop" role="presentation" onClick={() => setConfirm(null)}>
+          <div
+            className="confirm"
+            role="alertdialog"
+            aria-modal="true"
+            aria-label={confirm.title}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <strong>{confirm.title}</strong>
+            <p>{confirm.detail}</p>
+            <div className="row">
+              <button className="btn-ghost" type="button" onClick={() => setConfirm(null)}>
+                Cancel
+              </button>
+              <button className="btn-danger" type="button" onClick={confirm.action}>
+                Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
       <header className="topbar">
         <div className="brand">
           <div className="mark" aria-hidden="true">
@@ -344,6 +396,7 @@ export function App() {
           onUpload={onUpload}
           onToggle={onToggle}
           onDelete={onDelete}
+          onError={setBanner}
         />
         <ChatPanel
           sessions={sessions}
@@ -368,30 +421,4 @@ export function App() {
       </main>
     </div>
   );
-}
-
-function artifactsFromSession(detail: {
-  messages: ChatMessage[];
-  artifacts: Array<{ kind: string; payload: Artifacts[keyof Artifacts] }>;
-}): Artifacts {
-  const studio: Artifacts = {};
-  for (const message of detail.messages) {
-    Object.assign(studio, message.artifacts);
-  }
-  for (const artifact of detail.artifacts) {
-    if (artifact.kind === "podcast") {
-      studio.podcast = artifact.payload as Artifacts["podcast"];
-    } else if (artifact.kind === "quiz") {
-      studio.quiz = artifact.payload as Artifacts["quiz"];
-    } else if (artifact.kind === "infographic") {
-      studio.infographic = artifact.payload as Artifacts["infographic"];
-    }
-  }
-  return studio;
-}
-
-function messageFrom(error: unknown, fallback: string) {
-  if (error instanceof ApiError) return error.message;
-  if (error instanceof Error && error.message) return error.message;
-  return fallback;
 }

@@ -2,6 +2,7 @@ import { useMemo } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { Citation } from "../types";
+import { toMarkdownWithCiteLinks } from "../utils/citations";
 
 type Props = {
   text: string;
@@ -9,7 +10,17 @@ type Props = {
   onOpenSource?: (sourceId: string) => void;
 };
 
-const CITATION = /\[Source:\s*([^,\]]+?),\s*Chunk:\s*([^\]]+?)\s*\]/g;
+function safeUrl(url: string): string {
+  try {
+    const parsed = new URL(url, window.location.origin);
+    if (parsed.protocol === "http:" || parsed.protocol === "https:" || url.startsWith("#cite-")) {
+      return url;
+    }
+  } catch {
+    if (url.startsWith("#cite-")) return url;
+  }
+  return "#blocked";
+}
 
 export function CitationText({ text, citations, onOpenSource }: Props) {
   const { markdown, refs } = useMemo(() => toMarkdownWithCiteLinks(text, citations), [text, citations]);
@@ -18,6 +29,7 @@ export function CitationText({ text, citations, onOpenSource }: Props) {
     <div className="answer markdown">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
+        urlTransform={safeUrl}
         components={{
           a({ href, children }) {
             if (href?.startsWith("#cite-")) {
@@ -39,7 +51,7 @@ export function CitationText({ text, citations, onOpenSource }: Props) {
               return <span className="cite-plain">{children}</span>;
             }
             return (
-              <a href={href} target="_blank" rel="noreferrer">
+              <a href={href} target="_blank" rel="noreferrer noopener">
                 {children}
               </a>
             );
@@ -50,30 +62,4 @@ export function CitationText({ text, citations, onOpenSource }: Props) {
       </ReactMarkdown>
     </div>
   );
-}
-
-function findCitation(citations: Citation[], filename: string, chunkId: string) {
-  const exact = citations.find((item) => item.filename === filename && item.chunkId === chunkId);
-  if (exact) return exact;
-  const lowerFilename = filename.toLowerCase();
-  const lowerChunk = chunkId.toLowerCase();
-  const caseInsensitive = citations.find(
-    (item) => item.filename.toLowerCase() === lowerFilename && item.chunkId.toLowerCase() === lowerChunk,
-  );
-  if (caseInsensitive) return caseInsensitive;
-  // chunkIds are globally unique (full source uuid + index), so a chunkId-only
-  // match still resolves even if the filename was edited after ingestion.
-  return citations.find((item) => item.chunkId === chunkId || item.chunkId.toLowerCase() === lowerChunk);
-}
-
-function toMarkdownWithCiteLinks(text: string, citations: Citation[]) {
-  const refs: Array<Citation | null> = [];
-  const markdown = text.replace(CITATION, (_full, rawFilename: string, rawChunkId: string) => {
-    const filename = (rawFilename ?? "").trim() || "source";
-    const chunkId = (rawChunkId ?? "").trim();
-    refs.push(findCitation(citations, filename, chunkId) ?? null);
-    const label = `${filename} · ${chunkId}`.replace(/[\[\]]/g, "").slice(0, 120);
-    return `[${label}](#cite-${refs.length - 1})`;
-  });
-  return { markdown, refs };
 }

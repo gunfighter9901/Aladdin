@@ -82,7 +82,12 @@ def _finish_studio_trace(kind: str, payload: dict) -> None:
 
 
 def _save(db: Session, kind: str, payload: dict, session_id: str | None) -> None:
+    import logging
+
     if session_id and db.get(ChatSession, session_id) is None:
+        logging.getLogger("educator.studio").warning(
+            "Studio artifact %s references a missing session; storing it without a session link", kind
+        )
         session_id = None
     db.add(
         Artifact(

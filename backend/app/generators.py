@@ -103,9 +103,11 @@ Source excerpts:
         if len("\n".join(dialogue_lines + [line])) > budget:
             break
         dialogue_lines.append(line)
+    truncated = len(dialogue_lines) < len(turns)
     # Always keep at least the first two turns so both voices are heard.
     if len(dialogue_lines) < 2:
         dialogue_lines = [f"{turn['speaker']}: {turn['text']}" for turn in turns[:2]]
+        truncated = len(turns) > 2
     dialogue = "\n".join(dialogue_lines)
     audio_b64 = ""
     mime = "audio/wav"
@@ -132,6 +134,7 @@ Source excerpts:
         "sampleRateHz": 24000,
         "voices": {"Joe": "Puck", "Jane": "Kore"},
         "audioError": audio_error,
+        "truncated": truncated,
     }
 
 
@@ -187,7 +190,13 @@ Source excerpts:
         input={"source_ids": source_ids, "focus": truncate(focus, 1000), "count": count},
         output={"title": quiz.title.strip() or "Active recall", "question_count": len(questions)},
     )
-    return {"title": quiz.title.strip() or "Active recall", "questions": questions, "flashcards": flashcards}
+    return {
+        "title": quiz.title.strip() or "Active recall",
+        "questions": questions,
+        "flashcards": flashcards,
+        "requestedCount": count,
+        "returnedCount": len(questions),
+    }
 
 
 async def generate_infographic(
@@ -272,12 +281,24 @@ async def _retrieve_study_context(source_ids: list[str], focus: str) -> tuple[st
         raise AppError("Select at least one source. An empty selection retrieves nothing.")
     store = get_store()
     hits: list[Hit] = []
+    fallback_used = False
     if focus.strip():
         hits = await asyncio.to_thread(store.search, focus.strip(), ids, 8)
     if not hits:
         hits = await asyncio.to_thread(store.sample, ids, 8)
+        fallback_used = bool(hits and focus.strip())
     if not hits:
         raise AppError("The selected materials do not contain retrievable text.", status_code=404)
+    # Dedup identical chunk payloads that can repeat across overlapping windows.
+    seen_texts: set[str] = set()
+    unique: list[Hit] = []
+    for hit in hits:
+        key = f"{hit.source_id}\x00{hit.chunk_id}\x00{hit.text}"
+        if key in seen_texts:
+            continue
+        seen_texts.add(key)
+        unique.append(hit)
+    hits = unique
     blocks = []
     for hit in hits:
         page = f", page {hit.page_number}" if hit.page_number else ""
@@ -285,7 +306,7 @@ async def _retrieve_study_context(source_ids: list[str], focus: str) -> tuple[st
     context = _truncate_at_sentence("\n\n".join(blocks), 14000)
     update_span(
         input={"source_ids": ids, "focus": truncate(focus, 1000)},
-        output={"hit_count": len(hits), "context_chars": len(context)},
+        output={"hit_count": len(hits), "context_chars": len(context), "fallback_used": fallback_used},
         metadata={"chunks": chunk_preview(hits)},
     )
     return context, hits

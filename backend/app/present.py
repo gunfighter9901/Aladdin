@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from app.models import Artifact, ChatSession, Message, Source
 from app.schemas import ArtifactOut, CitationOut, MessageOut, SessionOut, SourceOut, TraceStep
+
+logger = logging.getLogger("educator.present")
 
 
 def source_out(source: Source) -> SourceOut:
@@ -72,4 +75,5 @@ def _load(raw: str, fallback: Any) -> Any:
     try:
         return json.loads(raw or "")
     except json.JSONDecodeError:
+        logger.warning("Dropping a malformed JSON column; returning the fallback")
         return fallback

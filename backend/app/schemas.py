@@ -24,7 +24,7 @@ class SourceOut(BaseModel):
 
 class SourceUpdate(BaseModel):
     active: bool | None = None
-    title: str | None = None
+    title: str | None = Field(default=None, max_length=180)
 
 
 class CollectionOut(BaseModel):
@@ -44,8 +44,8 @@ class SessionOut(BaseModel):
 
 
 class SessionCreate(BaseModel):
-    title: str | None = None
-    sessionId: str | None = None
+    title: str | None = Field(default=None, max_length=120)
+    sessionId: str | None = Field(default=None, max_length=64)
 
 
 class CitationOut(BaseModel):
@@ -64,9 +64,9 @@ class TraceStep(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    sessionId: str
+    sessionId: str = Field(min_length=1, max_length=64)
     message: str = Field(min_length=1, max_length=8000)
-    activeSourceIds: list[str] = Field(default_factory=list)
+    activeSourceIds: list[str] = Field(default_factory=list, max_length=64)
 
 
 class ChatResponse(BaseModel):
@@ -103,11 +103,16 @@ class SessionDetail(BaseModel):
 
 
 class GenerateRequest(BaseModel):
-    sourceIds: list[str] = Field(default_factory=list)
-    sessionId: str | None = None
-    focus: str = ""
+    sourceIds: list[str] = Field(default_factory=list, max_length=64)
+    sessionId: str | None = Field(default=None, max_length=64)
+    focus: str = Field(default="", max_length=2000)
     count: int = Field(default=5, ge=1, le=12)
     diagramType: Literal["mindmap", "flowchart", "timeline", "sequence"] = "mindmap"
+
+
+class Pagination(BaseModel):
+    limit: int = Field(default=100, ge=1, le=500)
+    offset: int = Field(default=0, ge=0)
 
 
 class HealthOut(BaseModel):

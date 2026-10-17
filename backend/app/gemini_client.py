@@ -6,11 +6,14 @@ pipelines, which are also the implementations behind the agent's tools.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import json
+import logging
 import os
 import wave
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from app.config import settings
@@ -18,6 +21,29 @@ from app.errors import GeminiUnavailable
 from app.safety import safe_error_message
 
 from opik import track
+
+logger = logging.getLogger("educator.gemini")
+
+
+async def _with_retry(label: str, call: Callable[[], Awaitable[Any]]) -> Any:
+    """Run one Gemini call with a timeout and a single retry on transient failures."""
+    timeout = max(5.0, float(settings.gemini_timeout_s))
+    last: Exception | None = None
+    for attempt in (1, 2):
+        try:
+            return await asyncio.wait_for(call(), timeout=timeout)
+        except (TimeoutError, asyncio.TimeoutError) as exc:
+            last = exc
+            logger.warning("Gemini %s timed out (attempt %s)", label, attempt)
+        except GeminiUnavailable:
+            raise
+        except Exception as exc:  # noqa: BLE001 - mapped to a safe message below
+            message = safe_error_message(exc)
+            if attempt == 2 or "rejected" in message.lower() or "api key" in message.lower():
+                raise GeminiUnavailable(message) from exc
+            last = exc
+            logger.warning("Gemini %s failed transiently (attempt %s)", label, attempt)
+    raise GeminiUnavailable(safe_error_message(last) if last else "The model service is unavailable.") from last
 
 QUIZ_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -174,12 +200,18 @@ async def _llm_text(client: GeminiClient, prompt: str, *, temperature: float) ->
     from app.observability import truncate, update_span
 
     raw = client.require()
-    try:
-        response = await raw.aio.models.generate_content(
+
+    async def _call() -> Any:
+        return await raw.aio.models.generate_content(
             model=settings.reasoning_model,
             contents=prompt,
             config={"temperature": temperature},
         )
+
+    try:
+        response = await _with_retry("text", _call)
+    except GeminiUnavailable:
+        raise
     except Exception as exc:
         raise GeminiUnavailable(safe_error_message(exc)) from exc
     text = (getattr(response, "text", None) or "").strip()
@@ -208,12 +240,18 @@ async def _llm_json(
         response_mime_type="application/json",
         response_schema=_as_schema(types, schema),
     )
-    try:
-        response = await raw_client.aio.models.generate_content(
+
+    async def _call() -> Any:
+        return await raw_client.aio.models.generate_content(
             model=settings.reasoning_model,
             contents=prompt,
             config=config,
         )
+
+    try:
+        response = await _with_retry("json", _call)
+    except GeminiUnavailable:
+        raise
     except Exception as exc:
         raise GeminiUnavailable(safe_error_message(exc)) from exc
     raw = (getattr(response, "text", None) or "").strip()
@@ -244,12 +282,18 @@ async def _llm_transcribe(
     from google.genai import types
 
     part = _media_part(types, data, mime_type)
-    try:
-        response = await raw.aio.models.generate_content(
+
+    async def _call() -> Any:
+        return await raw.aio.models.generate_content(
             model=settings.reasoning_model,
             contents=[part, prompt],
             config={"temperature": 0.2},
         )
+
+    try:
+        response = await _with_retry("transcribe", _call)
+    except GeminiUnavailable:
+        raise
     except Exception as exc:
         raise GeminiUnavailable(safe_error_message(exc)) from exc
     text = (getattr(response, "text", None) or "").strip()
@@ -293,12 +337,17 @@ async def _llm_tts(client: GeminiClient, dialogue: str) -> tuple[str, str]:
             )
         ),
     )
-    try:
-        response = await raw.aio.models.generate_content(
+    async def _call() -> Any:
+        return await raw.aio.models.generate_content(
             model=settings.tts_model,
             contents=dialogue,
             config=config,
         )
+
+    try:
+        response = await _with_retry("tts", _call)
+    except GeminiUnavailable:
+        raise
     except Exception as exc:
         raise GeminiUnavailable(safe_error_message(exc)) from exc
     audio = _extract_audio(response)

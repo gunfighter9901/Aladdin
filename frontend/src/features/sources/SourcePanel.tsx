@@ -1,6 +1,8 @@
 import { useState } from "react";
 import type { FormEvent } from "react";
+import { ACCEPTED_EXTENSIONS, MAX_TITLE_LENGTH } from "../../config";
 import type { CollectionInfo, Source } from "../../types";
+import { checkFile, checkPastedText, checkUrl } from "../../utils/validation";
 
 type Props = {
   sources: Source[];
@@ -12,6 +14,7 @@ type Props = {
   onUpload: (form: FormData) => Promise<void>;
   onToggle: (source: Source, active: boolean) => void;
   onDelete: (source: Source) => void;
+  onError: (message: string) => void;
 };
 
 export function SourcePanel({
@@ -24,6 +27,7 @@ export function SourcePanel({
   onUpload,
   onToggle,
   onDelete,
+  onError,
 }: Props) {
   const [url, setUrl] = useState("");
   const [text, setText] = useState("");
@@ -32,20 +36,42 @@ export function SourcePanel({
 
   async function submitUrl(event: FormEvent) {
     event.preventDefault();
+    const problem = checkUrl(url);
+    if (problem) {
+      onError(problem);
+      return;
+    }
     const form = new FormData();
     form.set("url", url.trim());
-    if (title.trim()) form.set("title", title.trim());
+    if (title.trim()) form.set("title", title.trim().slice(0, MAX_TITLE_LENGTH));
     await onUpload(form);
     setUrl("");
   }
 
   async function submitText(event: FormEvent) {
     event.preventDefault();
+    const problem = checkPastedText(text);
+    if (problem) {
+      onError(problem);
+      return;
+    }
     const form = new FormData();
     form.set("text", text);
-    if (title.trim()) form.set("title", title.trim());
+    if (title.trim()) form.set("title", title.trim().slice(0, MAX_TITLE_LENGTH));
     await onUpload(form);
     setText("");
+  }
+
+  function submitFile(file: File) {
+    const problem = checkFile(file);
+    if (problem) {
+      onError(problem);
+      return;
+    }
+    const form = new FormData();
+    form.set("file", file);
+    if (title.trim()) form.set("title", title.trim().slice(0, MAX_TITLE_LENGTH));
+    void onUpload(form);
   }
 
   if (collapsed) {
@@ -93,23 +119,24 @@ export function SourcePanel({
             <input
               type="file"
               aria-label="Upload a study file"
-              accept=".pdf,.md,.markdown,.txt,.png,.jpg,.jpeg,.webp,.gif,.wav,.mp3,.m4a,.webm,.ogg,.flac"
+              accept={ACCEPTED_EXTENSIONS.join(",")}
               disabled={busy}
               onChange={(event) => {
                 const file = event.target.files?.[0];
                 if (!file) return;
-                const form = new FormData();
-                form.set("file", file);
-                if (title.trim()) form.set("title", title.trim());
-                void onUpload(form).finally(() => {
-                  event.target.value = "";
-                });
+                submitFile(file);
+                event.target.value = "";
               }}
             />
           </label>
           <label className="field">
             Optional title
-            <input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Lecture 4 notes" />
+            <input
+              value={title}
+              maxLength={MAX_TITLE_LENGTH}
+              onChange={(event) => setTitle(event.target.value)}
+              placeholder="Lecture 4 notes"
+            />
           </label>
           <form className="src-form" onSubmit={submitUrl}>
             <label className="field">

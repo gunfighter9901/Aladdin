@@ -11,35 +11,68 @@ import type {
   StudySession,
   TraceStep,
 } from "./types";
+import { JSON_TIMEOUT_MS, apiPath } from "./config";
 
 export class ApiError extends Error {
   status: number;
+  code?: string;
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, code?: string) {
     super(message);
     this.status = status;
+    this.code = code;
   }
 }
 
-async function parseError(response: Response): Promise<string> {
+async function parseError(response: Response): Promise<{ message: string; code?: string }> {
   try {
-    const body = (await response.json()) as { detail?: unknown };
-    if (typeof body.detail === "string") return body.detail;
-    if (body.detail) return "The request could not be completed.";
+    const body = (await response.json()) as { detail?: unknown; code?: unknown };
+    const code = typeof body.code === "string" ? body.code : undefined;
+    if (typeof body.detail === "string") return { message: body.detail, code };
+    if (Array.isArray(body.detail)) {
+      return { message: "That request was not valid.", code: code ?? "validation_error" };
+    }
+    if (body.detail) return { message: "The request could not be completed.", code };
   } catch {
     /* The body was not JSON. */
   }
-  return response.statusText || "The request failed.";
+  return { message: response.statusText || "The request failed." };
 }
 
-export async function api<T>(path: string, init?: RequestInit): Promise<T> {
+function withTimeout(signal?: AbortSignal, ms: number = JSON_TIMEOUT_MS): { signal: AbortSignal; cancel: () => void } {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(new DOMException("Request timed out", "TimeoutError")), ms);
+  const cancel = () => window.clearTimeout(timer);
+  if (signal) {
+    if (signal.aborted) controller.abort(signal.reason);
+    else signal.addEventListener("abort", () => controller.abort(signal.reason), { once: true });
+  }
+  return { signal: controller.signal, cancel };
+}
+
+export async function api<T>(path: string, init?: RequestInit, timeoutMs?: number): Promise<T> {
   const headers = new Headers(init?.headers);
   if (init?.body && !(init.body instanceof FormData) && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
-  const response = await fetch(path, { ...init, headers });
+  // Uploads and streams manage their own lifetime; only plain JSON calls time out here.
+  const needsTimeout = timeoutMs !== 0 && !(init?.body instanceof FormData) && !init?.signal;
+  const timeout = needsTimeout ? withTimeout(undefined, timeoutMs ?? JSON_TIMEOUT_MS) : null;
+  let response: Response;
+  try {
+    response = await fetch(apiPath(path), { ...init, headers, signal: timeout?.signal ?? init?.signal });
+  } catch (error) {
+    timeout?.cancel();
+    if (error instanceof DOMException && (error.name === "AbortError" || error.name === "TimeoutError")) {
+      throw new ApiError(408, "The request timed out. Try again in a moment.", "timeout");
+    }
+    throw error;
+  } finally {
+    timeout?.cancel();
+  }
   if (!response.ok) {
-    throw new ApiError(response.status, await parseError(response));
+    const { message, code } = await parseError(response);
+    throw new ApiError(response.status, message, code);
   }
   if (response.status === 204) return undefined as T;
   return (await response.json()) as T;
@@ -62,11 +95,11 @@ export function uploadSource(form: FormData) {
 }
 
 export function updateSource(id: string, body: { active?: boolean; title?: string }) {
-  return api<Source>(`/api/sources/${id}`, { method: "PATCH", body: JSON.stringify(body) });
+  return api<Source>(`/api/sources/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(body) });
 }
 
 export function deleteSource(id: string) {
-  return api<void>(`/api/sources/${id}`, { method: "DELETE" });
+  return api<void>(`/api/sources/${encodeURIComponent(id)}`, { method: "DELETE" });
 }
 
 export function listSessions() {
@@ -81,11 +114,11 @@ export function createSession(title?: string) {
 }
 
 export function getSession(id: string) {
-  return api<SessionDetail>(`/api/sessions/${id}`);
+  return api<SessionDetail>(`/api/sessions/${encodeURIComponent(id)}`);
 }
 
 export function deleteSession(id: string) {
-  return api<void>(`/api/sessions/${id}`, { method: "DELETE" });
+  return api<void>(`/api/sessions/${encodeURIComponent(id)}`, { method: "DELETE" });
 }
 
 export type StreamDone = {
@@ -109,14 +142,15 @@ export async function streamChat(
   onEvent: (event: StreamEvent) => void,
   signal?: AbortSignal,
 ) {
-  const response = await fetch("/api/chat/stream", {
+  const response = await fetch(apiPath("/api/chat/stream"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
     signal,
   });
   if (!response.ok || !response.body) {
-    throw new ApiError(response.status, await parseError(response));
+    const { message, code } = await parseError(response);
+    throw new ApiError(response.status, message, code);
   }
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -132,15 +166,18 @@ export async function streamChat(
 }
 
 function drainSse(buffer: string, onEvent: (event: StreamEvent) => void) {
-  const chunks = buffer.split("\n\n");
+  // SSE frames end with a blank line; servers may use \n\n or \r\n\r\n.
+  const normalized = buffer.replace(/\r\n/g, "\n");
+  const chunks = normalized.split("\n\n");
   const rest = chunks.pop() ?? "";
   for (const chunk of chunks) {
-    if (!chunk.trim()) continue;
+    if (!chunk.trim() || chunk.trim().startsWith(":")) continue;
     let event = "message";
     const dataLines: string[] = [];
     for (const line of chunk.split("\n")) {
+      if (line.startsWith(":")) continue; // heartbeat comment
       if (line.startsWith("event:")) event = line.slice(6).trim();
-      if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
+      else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
     }
     if (!dataLines.length) continue;
     let data: StreamEvent["data"];

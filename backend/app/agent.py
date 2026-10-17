@@ -6,6 +6,7 @@ from the model schema only when it can see the real ``ToolContext`` type.
 
 import inspect
 import logging
+import threading
 from typing import Any
 
 try:
@@ -188,7 +189,12 @@ async def quiz_generator(focus: str, count: int, tool_context: ToolContext) -> d
         update_span(output={"status": "empty"})
         return {"status": "empty", "message": "Select at least one source before making a quiz."}
     try:
-        payload = await generate_quiz(ids, focus, max(1, min(int(count or 5), 12)))
+        requested = int(count if count is not None else 5)
+    except (TypeError, ValueError):
+        return {"status": "error", "message": "Count must be a whole number between 1 and 12."}
+    requested = max(1, min(requested, 12))
+    try:
+        payload = await generate_quiz(ids, focus, requested)
     except Exception as exc:
         update_span(output={"status": "error"}, metadata={"error": truncate(_tool_error(exc), 500)})
         return {"status": "error", "message": _tool_error(exc)}
@@ -242,37 +248,51 @@ class AgentRuntime:
         self.session_service = None
         self.tracer = None
         self.ready = False
+        self._lock = threading.Lock()
 
     def start(self) -> None:
-        from google.adk.agents import LlmAgent
-        from google.adk.runners import Runner
-        from google.adk.sessions import DatabaseSessionService
+        with self._lock:
+            if self.ready:
+                logger.info("ADK educator agent is already running; start() is a no-op")
+                return
+            from google.adk.agents import LlmAgent
+            from google.adk.runners import Runner
+            from google.adk.sessions import DatabaseSessionService
 
-        self.session_service = DatabaseSessionService(
-            db_url=f"sqlite+aiosqlite:///{settings.adk_sqlite_path}"
-        )
-        web_search = build_web_search_tool(settings.reasoning_model)
-        self.agent = LlmAgent(
-            name="educator",
-            model=settings.reasoning_model,
-            description="A local tutor that answers from the student's selected materials and cites them.",
-            instruction=TUTOR_INSTRUCTION,
-            tools=[
-                rag_retriever,
-                web_search,
-                podcast_generator,
-                quiz_generator,
-                infographic_creator,
-            ],
-        )
-        self.tracer = instrument_agent(self.agent)
-        self.runner = Runner(
-            agent=self.agent,
-            app_name=APP_NAME,
-            session_service=self.session_service,
-        )
-        self.ready = True
-        logger.info("ADK educator agent is ready")
+            try:
+                self.session_service = DatabaseSessionService(
+                    db_url=f"sqlite+aiosqlite:///{settings.adk_sqlite_path}"
+                )
+                web_search = build_web_search_tool(settings.reasoning_model)
+                self.agent = LlmAgent(
+                    name="educator",
+                    model=settings.reasoning_model,
+                    description="A local tutor that answers from the student's selected materials and cites them.",
+                    instruction=TUTOR_INSTRUCTION,
+                    tools=[
+                        rag_retriever,
+                        web_search,
+                        podcast_generator,
+                        quiz_generator,
+                        infographic_creator,
+                    ],
+                )
+                self.tracer = instrument_agent(self.agent)
+                self.runner = Runner(
+                    agent=self.agent,
+                    app_name=APP_NAME,
+                    session_service=self.session_service,
+                )
+            except Exception:
+                logger.exception("ADK educator agent failed to start")
+                self.agent = None
+                self.runner = None
+                self.session_service = None
+                self.tracer = None
+                self.ready = False
+                raise
+            self.ready = True
+            logger.info("ADK educator agent is ready")
 
     async def prepare(self) -> None:
         service = self.session_service

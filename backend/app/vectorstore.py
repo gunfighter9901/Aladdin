@@ -13,6 +13,7 @@ and are fetched once with `python scripts/download_model.py` after
 
 from __future__ import annotations
 
+import logging
 import threading
 import uuid
 from dataclasses import dataclass
@@ -42,6 +43,8 @@ from opik import track
 COLLECTION = settings.collection_name
 EMBEDDING_MODEL = settings.embedding_model
 VECTOR_SIZE = 384
+
+logger = logging.getLogger("educator.vectorstore")
 
 
 @dataclass(frozen=True)
@@ -137,9 +140,10 @@ class VectorStore:
                 field_name="sourceId",
                 field_schema=PayloadSchemaType.KEYWORD,
             )
-        except Exception:
+        except Exception as exc:
             # The index already exists after the first startup.
             # Local Qdrant also ignores payload indexes; filtering still works.
+            logger.debug("Payload index creation skipped: %s", type(exc).__name__)
             return
 
     def upsert_chunks(
@@ -174,7 +178,7 @@ class VectorStore:
         return _search_span(self, query, list(source_ids or []), limit)
 
     def sample(self, source_ids: list[str], limit: int = 8) -> list[Hit]:
-        return _sample_span(self, list(source_ids or []), limit)
+        return _sample_span(self, list(source_ids or []), max(1, min(int(limit or 8), 64)))
 
     def count(self) -> int:
         with self._lock:
@@ -199,6 +203,12 @@ def _upsert_span(store: VectorStore, *, source_id: str, filename: str, chunks: l
         return 0
     documents = [chunk.text for chunk in chunks]
     vectors = _embed_texts(documents)
+    if vectors and len(vectors[0]) != VECTOR_SIZE:
+        logger.warning(
+            "Embedding dimension %s does not match collection size %s; recreate the collection",
+            len(vectors[0]),
+            VECTOR_SIZE,
+        )
     created = datetime.now(timezone.utc).isoformat()
     points = []
     for chunk, vector in zip(chunks, vectors):
@@ -244,6 +254,7 @@ def _search_span(store: VectorStore, query: str, source_ids: list[str], limit: i
         )
         return []
     cap = limit or settings.retrieval_limit
+    cap = max(1, min(int(cap), 20))
     query_vector = _embed_texts([query.strip()])[0]
     with store._lock:
         if not store.client.collection_exists(store.collection):
