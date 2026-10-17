@@ -1,67 +1,108 @@
-# Eval Report — Educator RAG
+# Eval Report — Educator (RAG + Agentic + Performance)
 
-Date: 2026-10-17. Judge for all scores: `gemini-3.5-flash-lite` (same key as the app, via LiteLLM).
-Golden dataset: `golden_dataset.jsonl` → Opik dataset `Rag_eval` (20 items). Runner: `backend/scripts/evaluate_rag.py`.
+Date: 2026-10-17. Codebase read-only, no code changes.
+Env: macOS, Python 3.12.10 (`backend/.venv`), frontend `dist/` 3.8M.
+Judge for RAG scores: `gemini-3.5-flash-lite` (via LiteLLM). Golden dataset: `golden_dataset.jsonl` → Opik dataset `Rag_eval` (20 items). Runner: `backend/scripts/evaluate_rag.py`.
 
-## RAG settings
+## 1. RAG settings
 
-- Retrieval type: hybrid — dense semantic (Qdrant cosine over FastEmbed `BAAI/bge-small-en-v1.5`, binary quantization, on-disk payload) + async BM25 keyword search (stdlib Okapi BM25, `k1=1.5`, `b=0.75`, up to 1000 `$in`-filtered candidates per query, `backend/app/bm25.py` + `VectorStore.abm25_search`).
-- Reranking: Reciprocal Rank Fusion (`RRF k=60`, `dense_w=1.0`, `bm25_w=1.0`). Each branch over-fetches up to 20, RRF fuses the two ranked lists, and the fused order is the final ranking — the backend takes top-k chunks from it (`VectorStore.search` / `ahybrid_search` in `backend/app/vectorstore.py`).
-- Top-k: agent chat `retrieval_limit` = 6 (allowed 1–20); studio pipelines top-8 (+ sample-8 fallback).
-- Chunking: 480 tokens with 64 overlap. Sources isolated by `sourceId` (`$in` filter); empty selection retrieves nothing.
+- Retrieval: hybrid — dense (Qdrant cosine, FastEmbed `BAAI/bge-small-en-v1.5`, binary quantization, on-disk payload) + async BM25 (`k1=1.5`, `b=0.75`, up to 1000 `$in` candidates, `backend/app/bm25.py` + `VectorStore.abm25_search`).
+- Rerank: RRF (`k=60`, `dense_w=1.0`, `bm25_w=1.0`). Each branch over-fetches 20, fused order is final (`VectorStore.search` / `ahybrid_search`).
+- Top-k: chat `retrieval_limit`=6 (1–20); studio top-8 (+ sample-8 fallback).
+- Chunking: 480 tokens + 64 overlap. One collection `educator_sources`, isolated by `sourceId` (`$in`); empty selection retrieves nothing.
 
-## Golden-dataset results (20/20, 0 scoring failures)
+## 2. Golden-dataset results (20/20, 0 failures)
 
-> Note: scores below were measured with the previous dense-only retriever. Re-run `scripts/evaluate_rag.py` to refresh them for hybrid + RRF.
+> Scores measured with previous dense-only retriever. Re-run `scripts/evaluate_rag.py` for hybrid + RRF.
 
 | Metric | Avg | Meaning |
 |---|---|---|
 | hallucination (0 = clean) | 0.000 | No hallucinated answers |
 | answer_relevance | 1.000 | Every answer addressed the question |
-| context_precision | 1.000 | Retrieved chunks were on-topic |
-| context_recall | 0.850 | Some expected facts missing from retrieved context |
+| context_precision | 1.000 | Retrieved chunks on-topic |
+| context_recall | 0.850 | Some expected facts missing from context |
 
 Experiment: https://www.comet.com/opik/gunfighter9901/experiments/01a14928-4267-7247-920b-1358f9f7ae32/compare?experiments=%5B%2201a14992-633c-749b-a7f3-e0020cb27101%22%5D
 
-## Live showcase queries (same RAG, 6 chunks each)
+## 3. Live showcase (same RAG, 6 chunks each)
 
-| Query | Answer (truncated) | Hall. | Rel. | Recall | Prec. |
+| Query | Answer | Hall. | Rel. | Recall | Prec. |
 |---|---|---|---|---|---|
-| How do I undo the most recent commit but keep my code changes? | Use `git reset HEAD~1`. | 0.0 | 1.0 | 1.0 | 1.0 |
-| What welding processes join sheet-metal components? | MIG, TIG, spot, projection, laser welding. | 0.0 | 1.0 | 1.0 | 1.0 |
-| What is the capital of France? | The context does not contain the answer. | 0.0 | 1.0 | 1.0 | 1.0 |
+| Undo last commit, keep changes? | `git reset HEAD~1`. | 0.0 | 1.0 | 1.0 | 1.0 |
+| Welding for sheet-metal? | MIG, TIG, spot, projection, laser. | 0.0 | 1.0 | 1.0 | 1.0 |
+| Capital of France? | Context does not contain the answer. | 0.0 | 1.0 | 1.0 | 1.0 |
 
-## Interpretation
+Interpretation: grounded in-domain, honest OOD abstention. Recall 0.85 = local sources lack golden human-rights topics, not broken retriever.
 
-- The tutor is grounded: in-domain questions (git, sheet-metal — topics present in the 3 ingested sources) are answered from retrieved chunks with perfect scores.
-- Out-of-domain questions get an honest abstention instead of a guess (hallucination 0.0), which is the designed guardrail behavior.
-- Golden recall is 0.85 rather than 1.0 because the local sources don't cover the golden human-rights topics — the gap measures missing knowledge, not a broken retriever. Ingest sources covering the golden topics and re-run to see recall rise.
+## 4. Agentic Metrics (Autonomy & Problem Solving)
 
-## API
+Offline probes (real tokenizer, FakeStore, no LLM bulk eval — 15 req/min free tier, 20×5 calls too costly) + `pytest`:
+
+| Metric | Result | Proves |
+|---|---|---|
+| Suite | 40/40 in ~2.3s | No regressions |
+| Citation fidelity | 1 kept, hallucinated `fake-c9` dropped | Only retrieved `(filename,chunkId)` emitted |
+| Scope grounding | scoped lists `bio.txt/s1` + `only these`; empty → `none` + `Do not invent citations` | Muted/unselected never retrieved |
+| Isolation | `Filter(key=sourceId, MatchAny{a,b})` + post-filter | `$in` enforced |
+| Abstention | empty → `AppError Select at least one`; OOD → `context does not contain` | Guardrail |
+| Studio schema | bad quiz options dropped, podcast TTS-fail → `{audioBase64:"",audioError}`, mermaid strip + 1 repair, unknown → mindmap (5/5 validators) | Schema-valid outputs |
+| Safety | `../../etc/passwd→passwd`, `RuntimeError→Something went wrong`, `AIza` redacted, SSRF rejects `localhost/127/ftp` | No leak |
+| Autonomy (static) | 1 ADK `LlmAgent` + 5 tools (`rag_retriever`, `web_search`, `podcast/quiz/infographic`); ContextVars + `tool_context.state`, dual-written artifacts, full stream for Opik | ReAct loop |
+| Local knowledge | SQLite 4 sources `ready`; Qdrant 58 points | Read-only count |
+
+Marketing: answers cite checked sources, abstains when missing, never invents citations.
+
+## 5. Performance & Speed (UX)
+
+API via `TestClient` + FakeStore (local overhead, LLM excluded), n=50:
+
+| Endpoint | p50 | p95 | p99/max |
+|---|---|---|---|
+| `GET /api/health` | 0.59ms | 0.80ms | 6.73ms |
+| `GET /api/collection` | 0.60ms | 0.70ms | 0.84ms |
+| `GET /api/sources` | 1.12ms | 1.30ms | 2.79ms |
+| `GET /api/sessions` | 1.11ms | 1.33ms | 2.92ms |
+| `POST /api/chat` validation (422) | 1.73ms (1x) | — | — |
+| `POST /api/upload-source` text (live Gemini summary) | 1276ms (1x) | — | — |
+
+Primitives (CPU after warm):
+
+| Stage | Result |
+|---|---|
+| Tokenizer warm | 740.8ms once (cached) |
+| Chunk 30 pages → 30 chunks | 0.6ms, ~51k chunks/s, all ≤480 tok |
+| BM25 1000 docs | 1.3ms (common), 0.4ms (rare) |
+| RRF 20+20 | 0.004ms |
+
+Build/static:
+
+| Check | Result |
+|---|---|
+| `pytest` | 40 passed |
+| `tsc --noEmit` | 0 errors, 0.85s |
+| `compileall backend/app` | ok |
+| `dist/` | 3.8M, `index-*.js` 240K |
+
+Marketing: reads <2ms p50; chunk/BM25/RRF sub-2ms; uploads ~1.3s (Gemini summary).
+
+## 6. API
 
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/api/upload-source` | File, URL, or pasted text |
 | `GET` | `/api/sources` | Sources, summaries, chunk counts |
-| `PATCH` | `/api/sources/{id}` | Include or mute a source |
-| `DELETE` | `/api/sources/{id}` | Delete the source and its points |
-| `GET` | `/api/collection` | The single collection |
-| `POST` | `/api/chat` | ReAct turn, citations, trace, artifacts |
-| `POST` | `/api/chat/stream` | Same turn as server-sent events |
-| `POST` | `/api/generate-podcast` | Script and 24 kHz audio |
-| `POST` | `/api/generate-quiz` | Quiz and flashcards |
-| `POST` | `/api/generate-infographic` | Mermaid diagram |
-| `GET` | `/api/sessions` | Study sessions |
-| `POST` | `/api/sessions` | Create a session |
-| `GET` | `/api/sessions/{id}` | Messages and studio artifacts |
-| `GET` | `/api/health` | Ready state. Booleans only, no secrets |
+| `PATCH` | `/api/sources/{id}` | Include/mute |
+| `DELETE` | `/api/sources/{id}` | Delete + points |
+| `GET` | `/api/collection` | Single collection |
+| `POST` | `/api/chat` | ReAct turn, citations, trace |
+| `POST` | `/api/chat/stream` | Same as SSE |
+| `POST` | `/api/generate-podcast` | Script + 24kHz audio |
+| `POST` | `/api/generate-quiz` | Quiz + flashcards |
+| `POST` | `/api/generate-infographic` | Mermaid |
+| `GET` | `/api/sessions` | List |
+| `POST` | `/api/sessions` | Create |
+| `GET` | `/api/sessions/{id}` | Messages + artifacts |
+| `GET` | `/api/health` | Ready, booleans only |
 
-## Re-run
 
-```bash
-cd backend
-pkill -f "uvicorn app.main"   # local Qdrant allows one process at a time
-./.venv/bin/python scripts/evaluate_rag.py            # full golden set
-./.venv/bin/python scripts/evaluate_rag.py --samples 5  # quick check
-./.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000  # restart
-```
+Limits: no live ADK TTFT/TTS timing (quota); no k6/Lighthouse; RAG scores pre-hybrid; single-process Qdrant respected.
