@@ -44,7 +44,7 @@ The **Agentic RAG Educator & AI Research Assistant** is a full-stack web applica
 - **App data**: SQLite for sources, sessions, and messages.
 - **Vectors**: Qdrant + FastEmbed `BAAI/bge-small-en-v1.5` (local CPU embeddings).
 - **AI Models (Gemini API)**:
-  - Text, agent reasoning, and image transcription: `gemini-3.1-flash-lite`
+  - Text, agent reasoning, and image transcription: `gemini-3.5-flash-lite`
   - Text-to-Speech (Podcasts): `gemini-3.1-flash-tts-preview` with multi-speaker voice config
   - Web grounding: ADK Google Search tool
 - **Observability**: Opik full traces only. No Ragas.
@@ -91,7 +91,7 @@ The **Agentic RAG Educator & AI Research Assistant** is a full-stack web applica
   - Dynamic filtering uses the `$in` operator: queries strictly search within the user's selected active sources (`active_sources`).
 
 ### 2. Google ADK ReAct Agent & Opik
-- **Agent**: one ADK `LlmAgent` (`gemini-3.1-flash-lite`) with these tools:
+- **Agent**: one ADK `LlmAgent` (`gemini-3.5-flash-lite`) with these tools:
   1. Analyzes the user prompt against conversation history and the selected sources.
   2. Calls tools as needed:
      - `rag_retriever`: Vector search with a `$in` filter on active source ids.
@@ -163,7 +163,7 @@ my-project/
 - Agent runtime is Google ADK, not a custom ReAct loop and not LangChain.
 - Observability is Opik full traces only. Do not add a Ragas script or wrapper. `evaluation_observability.md` is reference only; ignore its Ragas sections.
 - Backend is Python FastAPI. Frontend is React + Vite. No auth.
-- Reasoning and image transcription model is `gemini-3.1-flash-lite`.
+- Reasoning and image transcription model is `gemini-3.5-flash-lite`.
 
 ## additional info
 - Embeddings and storage follow `embedding_vectorstore.md`: FastEmbed `BAAI/bge-small-en-v1.5`, Qdrant, binary quantization, on-disk payload. Chunking is token-aware and capped at 480 tokens with about 64 tokens of overlap, because this embedding model truncates at 512.

@@ -9,7 +9,7 @@ from app.config import settings
 from app.database import get_session
 from app.errors import AppError
 from app.ingestion import delete_source_vectors, ingest_upload
-from app.models import Source, utcnow, utcnow
+from app.models import Source, utcnow
 from app.present import source_out
 from app.schemas import CollectionOut, SourceOut, SourceUpdate
 from app.vectorstore import get_store

@@ -12,26 +12,24 @@ There is no login. It is a single-user app on your machine. Provider keys stay i
 
 ## Stack
 
-- React, Vite, TypeScript
-- Python FastAPI
-- Google ADK `LlmAgent` (`gemini-3.1-flash-lite`) with tools, not a hand-rolled loop
+- Frontend : React, Vite, TypeScript
+- Backend: Python FastAPI
+- Rag : Hybrid dense (FastEmbed cosine) + async BM25 fused with RRF rerank, top-k from the fused order (chat top-6, studio top-8)
+- Google ADK `LlmAgent` (`gemini-3.5-flash-lite`) with tools, not a hand-rolled loop
 - SQLite for sources, sessions, and messages
 - Qdrant local storage + FastEmbed `BAAI/bge-small-en-v1.5`
 - Gemini TTS `gemini-3.1-flash-tts-preview` (Joe / Puck, Jane / Kore, 24 kHz)
 - Opik traces via `OpikTracer` and `track_adk_agent_recursive`
 
-## Setup
+### Initial Setup (once)
 
-Needs Python 3.10+ and Node 20+. On macOS with system Python 3.9, use `python3.11` or `python3.12` for the virtualenv.
-
-### Initial setup (once)
+Needs Node 20+, use `python3.11` or `python3.12` for the virtualenvironment. 'git clone "this repo"'
 
 ```bash
 # 1. Backend key
 cd backend
 cp .env.example .env
 ```
-
 Set `GEMINI_API_KEY` in `backend/.env`. Never commit it.
 
 ```bash
@@ -40,7 +38,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# 3. Embedding model (cached in .venv, skipped if present)
+# 3. Embedding model (downloads embedding/sentence_similarity model)(cached in .venv, skipped if present)
 python scripts/download_model.py
 
 # 4. Frontend
@@ -97,24 +95,25 @@ The tutor is instructed to cite sources, to say when the selected materials do n
 
 Opik records the full ADK event stream, including the final response. There is no Ragas pipeline. If `OPIK_API_KEY` and `OPIK_URL_OVERRIDE` are both empty, the tracer is still attached and outbound shipping is disabled so a missing key does not stop a study session.
 
-## API
+## Evaluation
 
-| Method | Path | Purpose |
+Golden set (`golden_dataset.jsonl` → Opik dataset `Rag_eval`, 20 items) scored with Opik-native judges
+(`Hallucination`, `AnswerRelevance`, `ContextRecall`, `ContextPrecision`, judge `gemini-3.5-flash-lite`).
+Runner: `backend/scripts/evaluate_rag.py`. Full report: `EVAL_REPORT.md`.
+
+| Metric | Avg | Meaning |
 |---|---|---|
-| `POST` | `/api/upload-source` | File, URL, or pasted text |
-| `GET` | `/api/sources` | Sources, summaries, chunk counts |
-| `PATCH` | `/api/sources/{id}` | Include or mute a source |
-| `DELETE` | `/api/sources/{id}` | Delete the source and its points |
-| `GET` | `/api/collection` | The single collection |
-| `POST` | `/api/chat` | ReAct turn, citations, trace, artifacts |
-| `POST` | `/api/chat/stream` | Same turn as server-sent events |
-| `POST` | `/api/generate-podcast` | Script and 24 kHz audio |
-| `POST` | `/api/generate-quiz` | Quiz and flashcards |
-| `POST` | `/api/generate-infographic` | Mermaid diagram |
-| `GET` | `/api/sessions` | Study sessions |
-| `POST` | `/api/sessions` | Create a session |
-| `GET` | `/api/sessions/{id}` | Messages and studio artifacts |
-| `GET` | `/api/health` | Ready state. Booleans only, no secrets |
+| hallucination (0 = clean) | 0.000 | No hallucinated answers |
+| answer_relevance | 1.000 | Every answer addressed the question |
+| context_precision | 1.000 | Retrieved chunks were on-topic |
+| context_recall | 0.850 | Some expected facts missing from retrieved context |
+
+Experiment: https://www.comet.com/opik/gunfighter9901/experiments/01a14928-4267-7247-920b-1358f9f7ae32/compare?experiments=%5B%2201a14992-633c-749b-a7f3-e0020cb27101%22%5D
+
+Interpretation: the tutor is grounded — in-domain questions are answered from retrieved chunks, and
+out-of-domain questions get an honest "context does not contain the answer" instead of a guess.
+Recall is 0.85 rather than 1.0 because the ingested sources don't cover the golden human-rights topics;
+the gap measures missing knowledge, not a broken retriever.
 
 ## Keys
 
