@@ -159,6 +159,20 @@ async def run_turn(
         # tools that executed outside the ContextVar context.
         state_items = await _read_state_artifacts(session_id)
         artifacts = current_artifacts(state_items)
+        # Last-resort fallback: if a studio tool reported status ok but its
+        # pushed artifact never arrived (context/state channel lost), rebuild
+        # a playable-or-readable artifact from the FULL in-memory tool result.
+        # Context/state wins when present (it alone carries podcast audio).
+        for kind, fallback in _fallback_artifacts(trace).items():
+            artifacts.setdefault(kind, fallback)
+        if any(step.get("type") == "tool_result" and step.get("name") in _STUDIO_TOOLS for step in trace):
+            import logging as _logging
+
+            _logging.getLogger("educator.chat").info(
+                "Turn artifacts collected=%s tools=%s",
+                sorted(artifacts.keys()),
+                sorted({step.get("name") for step in trace if step.get("type") == "tool_result" and step.get("name")}),
+            )
         reset_artifacts(artifact_token)
 
     if not final_text:
@@ -402,6 +416,60 @@ def _function_responses(event: Any) -> list[dict[str, Any]]:
             }
         )
     return parsed
+
+
+_STUDIO_TOOLS = ("podcast_generator", "quiz_generator", "infographic_creator")
+
+
+def _fallback_artifacts(trace: list[dict[str, Any]]) -> dict[str, Any]:
+    """Rebuild studio artifacts from full tool results when push delivery failed.
+
+    Uses the UNSHRUNK in-memory trace (done.trace is shrunk and may truncate
+    large payloads). Podcast results carry script+turns but no audioBase64, so
+    the fallback shows the script with an explanatory hint; quiz/infographic
+    results already carry their full payloads.
+    """
+    found: dict[str, Any] = {}
+    for step in trace:
+        if step.get("type") != "tool_result":
+            continue
+        name = step.get("name")
+        result = step.get("result")
+        if not isinstance(result, dict) or result.get("status") != "ok":
+            continue
+        if name == "podcast_generator" and "podcast" not in found:
+            turns = [t for t in (result.get("turns") or []) if isinstance(t, dict)]
+            found["podcast"] = {
+                "title": str(result.get("title") or "Study podcast"),
+                "script": str(result.get("script") or ""),
+                "turns": turns,
+                "audioBase64": str(result.get("audioBase64") or ""),
+                "mimeType": "audio/wav",
+                "sampleRateHz": 24000,
+                "voices": {"Joe": "Puck", "Jane": "Kore"},
+                "audioError": result.get("audioError")
+                or "Audio did not arrive with this turn. Regenerate from the Studio panel for sound.",
+                "truncated": bool(result.get("truncated")),
+            }
+        elif name == "quiz_generator" and "quiz" not in found:
+            questions = result.get("questions")
+            if isinstance(questions, list) and questions:
+                found["quiz"] = {
+                    "title": str(result.get("title") or "Active recall"),
+                    "questions": questions,
+                    "flashcards": result.get("flashcards") or [],
+                    "requestedCount": result.get("requestedCount"),
+                    "returnedCount": result.get("returnedCount"),
+                }
+        elif name == "infographic_creator" and "infographic" not in found:
+            mermaid = result.get("mermaid")
+            if isinstance(mermaid, str) and mermaid.strip():
+                found["infographic"] = {
+                    "title": str(result.get("title") or "Diagram"),
+                    "diagramType": result.get("diagramType") or "mindmap",
+                    "mermaid": mermaid,
+                }
+    return found
 
 
 def _hits_from_result(result: Any) -> list[Hit]:

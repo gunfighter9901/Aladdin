@@ -5,12 +5,14 @@ Golden dataset: `golden_dataset.jsonl` → Opik dataset `Rag_eval` (20 items). R
 
 ## RAG settings
 
-- Retrieval type: dense semantic only (Qdrant cosine over FastEmbed `BAAI/bge-small-en-v1.5`, binary quantization, on-disk payload). No keyword/BM25, no hybrid.
-- Reranking: none.
+- Retrieval type: hybrid — dense semantic (Qdrant cosine over FastEmbed `BAAI/bge-small-en-v1.5`, binary quantization, on-disk payload) + async BM25 keyword search (stdlib Okapi BM25, `k1=1.5`, `b=0.75`, up to 1000 `$in`-filtered candidates per query, `backend/app/bm25.py` + `VectorStore.abm25_search`).
+- Reranking: Reciprocal Rank Fusion (`RRF k=60`, `dense_w=1.0`, `bm25_w=1.0`). Each branch over-fetches up to 20, RRF fuses the two ranked lists, and the fused order is the final ranking — the backend takes top-k chunks from it (`VectorStore.search` / `ahybrid_search` in `backend/app/vectorstore.py`).
 - Top-k: agent chat `retrieval_limit` = 6 (allowed 1–20); studio pipelines top-8 (+ sample-8 fallback).
 - Chunking: 480 tokens with 64 overlap. Sources isolated by `sourceId` (`$in` filter); empty selection retrieves nothing.
 
 ## Golden-dataset results (20/20, 0 scoring failures)
+
+> Note: scores below were measured with the previous dense-only retriever. Re-run `scripts/evaluate_rag.py` to refresh them for hybrid + RRF.
 
 | Metric | Avg | Meaning |
 |---|---|---|
@@ -34,6 +36,25 @@ Experiment: https://www.comet.com/opik/gunfighter9901/experiments/01a14928-4267-
 - The tutor is grounded: in-domain questions (git, sheet-metal — topics present in the 3 ingested sources) are answered from retrieved chunks with perfect scores.
 - Out-of-domain questions get an honest abstention instead of a guess (hallucination 0.0), which is the designed guardrail behavior.
 - Golden recall is 0.85 rather than 1.0 because the local sources don't cover the golden human-rights topics — the gap measures missing knowledge, not a broken retriever. Ingest sources covering the golden topics and re-run to see recall rise.
+
+## API
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/api/upload-source` | File, URL, or pasted text |
+| `GET` | `/api/sources` | Sources, summaries, chunk counts |
+| `PATCH` | `/api/sources/{id}` | Include or mute a source |
+| `DELETE` | `/api/sources/{id}` | Delete the source and its points |
+| `GET` | `/api/collection` | The single collection |
+| `POST` | `/api/chat` | ReAct turn, citations, trace, artifacts |
+| `POST` | `/api/chat/stream` | Same turn as server-sent events |
+| `POST` | `/api/generate-podcast` | Script and 24 kHz audio |
+| `POST` | `/api/generate-quiz` | Quiz and flashcards |
+| `POST` | `/api/generate-infographic` | Mermaid diagram |
+| `GET` | `/api/sessions` | Study sessions |
+| `POST` | `/api/sessions` | Create a session |
+| `GET` | `/api/sessions/{id}` | Messages and studio artifacts |
+| `GET` | `/api/health` | Ready state. Booleans only, no secrets |
 
 ## Re-run
 

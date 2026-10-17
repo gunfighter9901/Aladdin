@@ -1,7 +1,8 @@
 """Evaluate local RAG with Opik native metrics.
 
 Runs the same retriever + Gemini generator the ReAct agent uses
-(`app.vectorstore.get_store().search` + `app.gemini_client.get_gemini()`)
+(`app.vectorstore.get_store().search` = hybrid dense + async BM25 with RRF
+rerank, top-k is the final ranking + `app.gemini_client.get_gemini()`)
 against golden_dataset.jsonl, then scores with:
 
 - Hallucination, AnswerRelevance, ContextRecall, ContextPrecision
@@ -88,6 +89,8 @@ def run_rag(question: str, source_ids: list[str], limit: int) -> tuple[str, list
     from app.vectorstore import get_store
 
     hits = get_store().search(question, list(source_ids or []), limit) if source_ids else []
+    # search() is hybrid: dense + async BM25 fused with RRF; returned
+    # top-k order is the final ranking.
     contexts = [hit.text for hit in hits if hit.text and hit.text.strip()]
     if contexts:
         joined = "\n\n".join(f"[Chunk {i + 1}]\n{t[:2500]}" for i, t in enumerate(contexts))
@@ -212,6 +215,11 @@ def main() -> None:
         task_threads=max(1, int(args.task_threads or 1)),
         experiment_config={
             "retrieval_limit": int(args.retrieval_limit or 6),
+            "retrieval_type": "hybrid",
+            "dense_model": settings.embedding_model,
+            "keyword": f"BM25(k1={settings.bm25_k1},b={settings.bm25_b},cap={settings.bm25_candidate_cap})",
+            "rerank": f"RRF(k={settings.hybrid_rrf_k},dense_w={settings.hybrid_dense_weight},bm25_w={settings.hybrid_bm25_weight},overfetch={settings.hybrid_overfetch})",
+            "final_ranking": "top-k from RRF fused order",
             "reasoning_model": settings.reasoning_model,
             "ready_sources": len(source_ids),
             "judge_model": judge_model,

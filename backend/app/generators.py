@@ -283,7 +283,12 @@ async def _retrieve_study_context(source_ids: list[str], focus: str) -> tuple[st
     hits: list[Hit] = []
     fallback_used = False
     if focus.strip():
-        hits = await asyncio.to_thread(store.search, focus.strip(), ids, 8)
+        # Hybrid: dense + async BM25, RRF fused to top-k (final ranking).
+        ahybrid = getattr(store, "ahybrid_search", None)
+        if callable(ahybrid):
+            hits = await ahybrid(focus.strip(), ids, 8)
+        else:
+            hits = await asyncio.to_thread(store.search, focus.strip(), ids, 8)
     if not hits:
         hits = await asyncio.to_thread(store.sample, ids, 8)
         fallback_used = bool(hits and focus.strip())

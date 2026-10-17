@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { MAX_FOCUS_LENGTH } from "../../config";
 import type { Artifacts, DiagramType, InfographicPayload, PodcastPayload, QuizPayload } from "../../types";
 
@@ -22,6 +22,20 @@ export function StudioPanel({ artifacts, busy, canGenerate, onGenerate }: Props)
   const [focus, setFocus] = useState("");
   const [diagramType, setDiagramType] = useState<DiagramType>("mindmap");
   const [count, setCount] = useState(5);
+  const seenRef = useRef<{ podcast?: unknown; quiz?: unknown; infographic?: unknown }>({});
+
+  // Chat turns deliver artifacts silently into this panel. Auto-switch to a
+  // newly arrived artifact so a podcast made via chat is actually seen.
+  useEffect(() => {
+    const seen = seenRef.current;
+    const changed: Kind[] = [];
+    if (artifacts.podcast && artifacts.podcast !== seen.podcast) changed.push("podcast");
+    if (artifacts.quiz && artifacts.quiz !== seen.quiz) changed.push("quiz");
+    if (artifacts.infographic && artifacts.infographic !== seen.infographic) changed.push("infographic");
+    seenRef.current = { podcast: artifacts.podcast, quiz: artifacts.quiz, infographic: artifacts.infographic };
+    const latest = changed[changed.length - 1];
+    if (latest) setTab(latest);
+  }, [artifacts.podcast, artifacts.quiz, artifacts.infographic]);
 
   function clampCount(value: number) {
     if (!Number.isFinite(value)) return 5;

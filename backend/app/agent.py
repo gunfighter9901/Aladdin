@@ -62,7 +62,10 @@ def build_web_search_tool(model: str) -> Any:
 async def rag_retriever(query: str, tool_context: ToolContext) -> dict[str, Any]:
     """Search the student's selected study materials.
 
-    Uses a Qdrant $in filter (MatchAny) on sourceId. An empty selection returns
+    Hybrid retrieval: dense semantic search (Qdrant cosine over FastEmbed)
+    + async BM25 keyword search, fused with RRF. The fused order is the
+    final ranking and the backend takes top-k chunks from it. Uses a Qdrant
+    $in filter (MatchAny) on sourceId. An empty selection returns
     nothing and does not search. Muted sources are not in the id list, so they
     cannot appear in hits. Cite hits as [Source: filename, Chunk: chunkId].
 
@@ -94,7 +97,14 @@ async def rag_retriever(query: str, tool_context: ToolContext) -> dict[str, Any]
             "message": "No sources are selected. Retrieval returned nothing.",
             "hits": [],
         }
-    hits = await asyncio.to_thread(get_store().search, query, ids, settings.retrieval_limit)
+    store = get_store()
+    # Async hybrid: dense + BM25 run concurrently, RRF fused to top-k.
+    # Falls back to sync search() (also hybrid) for stores without the async API.
+    ahybrid = getattr(store, "ahybrid_search", None)
+    if callable(ahybrid):
+        hits = await ahybrid(query, ids, settings.retrieval_limit)
+    else:
+        hits = await asyncio.to_thread(store.search, query, ids, settings.retrieval_limit)
     if not hits:
         update_span(
             input={"query": truncate(query, 1000), "active_source_ids": ids},
@@ -166,10 +176,17 @@ async def podcast_generator(focus: str, tool_context: ToolContext) -> dict[str, 
         },
         metadata={"audio_error": payload.get("audioError")},
     )
+    # Return everything the Studio player needs EXCEPT the base64 audio
+    # (keeps the ADK trace small). The full payload incl. audio travels via
+    # push_artifact -> chat_runner done.artifacts. chat_runner also uses this
+    # stripped result as a fallback so the script still shows even if the
+    # artifact channel is lost.
     return {
         "status": "ok",
         "title": payload.get("title"),
         "script": payload.get("script"),
+        "turns": payload.get("turns") or [],
+        "truncated": payload.get("truncated"),
         "audioReady": bool(payload.get("audioBase64")),
         "audioError": payload.get("audioError"),
     }

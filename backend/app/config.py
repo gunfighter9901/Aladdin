@@ -54,6 +54,17 @@ class Settings(BaseSettings):
     max_chunks_per_source: int = 2000
     max_pdf_pages: int = 500
 
+    # Hybrid retrieval: dense (FastEmbed cosine) + async BM25 keyword search,
+    # fused with RRF. The fused order is the final ranking; the backend
+    # takes top-k (retrieval_limit) chunks from it.
+    bm25_k1: float = 1.5
+    bm25_b: float = 0.75
+    bm25_candidate_cap: int = 1000
+    hybrid_overfetch: int = 20
+    hybrid_rrf_k: int = 60
+    hybrid_dense_weight: float = 1.0
+    hybrid_bm25_weight: float = 1.0
+
     sqlite_path: Path = DATA_DIR / "educator.db"
     adk_sqlite_path: Path = DATA_DIR / "adk_sessions.db"
 
@@ -88,6 +99,20 @@ class Settings(BaseSettings):
             raise ValueError("retrieval_limit must be between 1 and 20")
         return value
 
+    @field_validator("bm25_candidate_cap", "hybrid_overfetch", "hybrid_rrf_k")
+    @classmethod
+    def _check_positive_int(cls, value: int) -> int:
+        if int(value) < 1:
+            raise ValueError("hybrid/bm25 caps must be >= 1")
+        return int(value)
+
+    @field_validator("bm25_k1", "bm25_b", "hybrid_dense_weight", "hybrid_bm25_weight")
+    @classmethod
+    def _check_non_negative_float(cls, value: float) -> float:
+        if float(value) < 0:
+            raise ValueError("bm25/hybrid weights must be >= 0")
+        return float(value)
+
     @field_validator("app_port")
     @classmethod
     def _check_port(cls, value: int) -> int:
@@ -99,6 +124,8 @@ class Settings(BaseSettings):
     def _check_overlap(self) -> Settings:
         if self.chunk_overlap < 0 or self.chunk_overlap >= self.chunk_tokens:
             raise ValueError("chunk_overlap must be >= 0 and smaller than chunk_tokens")
+        if not 0 <= self.bm25_b <= 1:
+            raise ValueError("bm25_b must be between 0 and 1")
         return self
 
     def opik_configured(self) -> bool:

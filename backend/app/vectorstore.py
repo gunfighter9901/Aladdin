@@ -4,6 +4,10 @@ Retrieval always applies a Qdrant MatchAny filter, which is the $in operator:
 queries search only the active source ids. An empty selection returns nothing
 and does not hit the store. Muted sources are simply absent from that list.
 
+Retrieval is hybrid: dense semantic search (FastEmbed cosine) + async BM25
+keyword search, fused with RRF. The fused order is the final ranking and the
+backend takes top-k chunks from it (``VectorStore.search``).
+
 Embeddings come from the standard FastEmbed package
 (`BAAI/bge-small-en-v1.5`). The model weights live in the virtualenv's
 FastEmbed cache (`$VIRTUAL_ENV/fastembed_cache`, via FASTEMBED_CACHE_PATH)
@@ -13,6 +17,7 @@ and are fetched once with `python scripts/download_model.py` after
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 import uuid
@@ -174,8 +179,32 @@ class VectorStore:
             )
 
     def search(self, query: str, source_ids: list[str], limit: int | None = None) -> list[Hit]:
-        """Empty selection retrieves nothing. The $in filter is mandatory."""
+        """Hybrid search (dense + BM25 + RRF). This fused order is final; top-k returned."""
+        return _hybrid_span(self, query, list(source_ids or []), limit)
+
+    def dense_search(self, query: str, source_ids: list[str], limit: int | None = None) -> list[Hit]:
+        """Dense semantic search only (FastEmbed cosine). Used for ablation/debug."""
         return _search_span(self, query, list(source_ids or []), limit)
+
+    def bm25_search(self, query: str, source_ids: list[str], limit: int | None = None) -> list[Hit]:
+        """BM25 keyword search only (no embeddings). Sync core for the async wrapper."""
+        return _bm25_span(self, query, list(source_ids or []), limit)
+
+    def hybrid_search(self, query: str, source_ids: list[str], limit: int | None = None) -> list[Hit]:
+        """Hybrid search (dense + BM25 + RRF). Same as search(); top-k from fused rank."""
+        return _hybrid_span(self, query, list(source_ids or []), limit)
+
+    async def abm25_search(
+        self, query: str, source_ids: list[str], limit: int | None = None
+    ) -> list[Hit]:
+        """Async BM25 keyword search. Scroll + scoring run off the event loop."""
+        return await asyncio.to_thread(self.bm25_search, query, list(source_ids or []), limit)
+
+    async def ahybrid_search(
+        self, query: str, source_ids: list[str], limit: int | None = None
+    ) -> list[Hit]:
+        """Async hybrid search. Dense + BM25 run concurrently, then RRF fuse to top-k."""
+        return await _ahybrid_span(self, query, list(source_ids or []), limit)
 
     def sample(self, source_ids: list[str], limit: int = 8) -> list[Hit]:
         return _sample_span(self, list(source_ids or []), max(1, min(int(limit or 8), 64)))
@@ -306,6 +335,207 @@ def _sample_span(store: VectorStore, source_ids: list[str], limit: int) -> list[
     update_span(
         input={"source_ids": ids, "limit": limit},
         output={"hit_count": len(hits)},
+        metadata={"chunks": chunk_preview(hits)},
+    )
+    return hits
+
+
+def _scroll_candidates(store: VectorStore, ids: list[str], cap: int) -> list[Hit]:
+    """Scroll up to `cap` $in-filtered points for BM25 scoring. Never raises."""
+    allowed = set(ids)
+    out: list[Hit] = []
+    offset: Any = None
+    page = 256
+    try:
+        with store._lock:
+            if not store.client.collection_exists(store.collection):
+                return []
+        while len(out) < cap:
+            fetch = min(page, cap - len(out))
+            with store._lock:
+                records, offset = store.client.scroll(
+                    collection_name=store.collection,
+                    scroll_filter=source_in_filter(ids),
+                    limit=fetch,
+                    offset=offset,
+                    with_payload=True,
+                )
+            if not records:
+                break
+            for record in records:
+                hit = _hit_from_payload(getattr(record, "payload", None) or {}, score=0.0)
+                if hit and hit.source_id in allowed:
+                    out.append(hit)
+                    if len(out) >= cap:
+                        break
+            if offset is None:
+                break
+    except Exception as exc:
+        logger.debug("BM25 candidate scroll skipped: %s", type(exc).__name__)
+    return out
+
+
+@track(name="bm25_search", type="tool", ignore_arguments=["store"])
+def _bm25_span(store: VectorStore, query: str, source_ids: list[str], limit: int | None) -> list[Hit]:
+    """Async-friendly BM25 keyword search over $in-filtered chunks. No embeddings."""
+    from app.bm25 import BM25, tokenize
+    from app.observability import chunk_preview, truncate, update_span
+
+    ids = [item for item in source_ids if item]
+    if not ids or not query.strip():
+        update_span(
+            input={"query": truncate(query, 1000), "source_ids": ids},
+            output={"hit_count": 0, "empty": True},
+        )
+        return []
+    query_tokens = tokenize(query)
+    if not query_tokens:
+        update_span(
+            input={"query": truncate(query, 1000), "source_ids": ids},
+            output={"hit_count": 0, "empty_query_tokens": True},
+        )
+        return []
+    cap = limit or settings.retrieval_limit
+    cap = max(1, min(int(cap), 20))
+    candidate_cap = max(1, int(settings.bm25_candidate_cap))
+    candidates = _scroll_candidates(store, ids, candidate_cap)
+    if not candidates:
+        update_span(
+            input={"query": truncate(query, 1000), "source_ids": ids},
+            output={"hit_count": 0, "no_candidates": True},
+        )
+        return []
+    docs_tokens = [tokenize(hit.text) for hit in candidates]
+    scorer = BM25(docs_tokens, k1=settings.bm25_k1, b=settings.bm25_b)
+    scores = scorer.score(query_tokens)
+    ranked = sorted(zip(candidates, scores), key=lambda pair: pair[1], reverse=True)
+    hits: list[Hit] = []
+    for hit, score in ranked[:cap]:
+        if score <= 0:
+            continue
+        hits.append(
+            Hit(
+                source_id=hit.source_id,
+                filename=hit.filename,
+                chunk_id=hit.chunk_id,
+                chunk_index=hit.chunk_index,
+                page_number=hit.page_number,
+                text=hit.text,
+                score=float(score),
+            )
+        )
+    update_span(
+        input={"query": truncate(query, 1000), "source_ids": ids, "limit": cap},
+        output={"hit_count": len(hits), "candidates": len(candidates)},
+        metadata={"chunks": chunk_preview(hits)},
+    )
+    return hits
+
+
+def _fuse_hits(dense_hits: list[Hit], bm25_hits: list[Hit], limit: int) -> list[Hit]:
+    """RRF fuse two ranked lists. Fused order is final; caller takes top-k."""
+    from app.bm25 import rrf_fuse
+
+    dense_rank = {(h.source_id, h.chunk_id): i + 1 for i, h in enumerate(dense_hits or [])}
+    bm25_rank = {(h.source_id, h.chunk_id): i + 1 for i, h in enumerate(bm25_hits or [])}
+    fused_scores = rrf_fuse(
+        dense_rank,
+        bm25_rank,
+        k=max(1, int(settings.hybrid_rrf_k)),
+        dense_weight=float(settings.hybrid_dense_weight),
+        bm25_weight=float(settings.hybrid_bm25_weight),
+    )
+    if not fused_scores:
+        return []
+    by_key: dict[tuple[str, str], Hit] = {}
+    for hit in list(dense_hits or []) + list(bm25_hits or []):
+        by_key.setdefault((hit.source_id, hit.chunk_id), hit)
+    fused: list[Hit] = []
+    for key, fused_score in fused_scores.items():
+        base = by_key.get(key)
+        if base is None:
+            continue
+        fused.append(
+            Hit(
+                source_id=base.source_id,
+                filename=base.filename,
+                chunk_id=base.chunk_id,
+                chunk_index=base.chunk_index,
+                page_number=base.page_number,
+                text=base.text,
+                score=float(fused_score),
+            )
+        )
+    fused.sort(key=lambda h: h.score, reverse=True)
+    return fused[: max(1, limit)]
+
+
+@track(name="hybrid_search", type="tool", ignore_arguments=["store"])
+def _hybrid_span(store: VectorStore, query: str, source_ids: list[str], limit: int | None) -> list[Hit]:
+    """Hybrid search: dense + BM25 run, RRF rerank, top-k returned as final ranking."""
+    from app.observability import chunk_preview, truncate, update_span
+
+    ids = [item for item in source_ids if item]
+    if not ids or not query.strip():
+        update_span(
+            input={"query": truncate(query, 1000), "source_ids": ids},
+            output={"hit_count": 0, "empty": True},
+        )
+        return []
+    cap = limit or settings.retrieval_limit
+    cap = max(1, min(int(cap), 20))
+    branch = max(cap, min(int(settings.hybrid_overfetch), 20))
+    try:
+        dense_hits = _search_span(store, query, ids, branch)
+    except Exception as exc:
+        logger.debug("Hybrid dense branch skipped: %s", type(exc).__name__)
+        dense_hits = []
+    try:
+        bm25_hits = _bm25_span(store, query, ids, branch)
+    except Exception as exc:
+        logger.debug("Hybrid BM25 branch skipped: %s", type(exc).__name__)
+        bm25_hits = []
+    hits = _fuse_hits(dense_hits, bm25_hits, cap)
+    # Post-filter: muted sources must never leak through fusion.
+    allowed = set(ids)
+    hits = [h for h in hits if h.source_id in allowed]
+    update_span(
+        input={"query": truncate(query, 1000), "source_ids": ids, "limit": cap},
+        output={
+            "hit_count": len(hits),
+            "dense_hit_count": len(dense_hits),
+            "bm25_hit_count": len(bm25_hits),
+        },
+        metadata={"chunks": chunk_preview(hits)},
+    )
+    return hits
+
+
+async def _ahybrid_span(store: VectorStore, query: str, source_ids: list[str], limit: int | None) -> list[Hit]:
+    """Async hybrid: dense + BM25 concurrently off the event loop, RRF fuse to top-k."""
+    from app.observability import chunk_preview, truncate, update_span
+
+    ids = [item for item in source_ids if item]
+    if not ids or not (query or "").strip():
+        return []
+    cap = limit or settings.retrieval_limit
+    cap = max(1, min(int(cap), 20))
+    branch = max(cap, min(int(settings.hybrid_overfetch), 20))
+    dense_task = asyncio.to_thread(_search_span, store, query, ids, branch)
+    bm25_task = asyncio.to_thread(_bm25_span, store, query, ids, branch)
+    results = await asyncio.gather(dense_task, bm25_task, return_exceptions=True)
+    dense_hits = results[0] if isinstance(results[0], list) else []
+    bm25_hits = results[1] if isinstance(results[1], list) else []
+    hits = _fuse_hits(dense_hits, bm25_hits, cap)
+    allowed = set(ids)
+    hits = [h for h in hits if h.source_id in allowed]
+    update_span(
+        input={"query": truncate(query, 1000), "source_ids": ids, "limit": cap},
+        output={
+            "hit_count": len(hits),
+            "dense_hit_count": len(dense_hits),
+            "bm25_hit_count": len(bm25_hits),
+        },
         metadata={"chunks": chunk_preview(hits)},
     )
     return hits

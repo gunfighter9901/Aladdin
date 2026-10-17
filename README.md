@@ -12,8 +12,9 @@ There is no login. It is a single-user app on your machine. Provider keys stay i
 
 ## Stack
 
-- React, Vite, TypeScript
-- Python FastAPI
+- Frontend : React, Vite, TypeScript
+- Backend: Python FastAPI
+- Rag : Hybrid dense (FastEmbed cosine) + async BM25 fused with RRF rerank, top-k from the fused order (chat top-6, studio top-8)
 - Google ADK `LlmAgent` (`gemini-3.5-flash-lite`) with tools, not a hand-rolled loop
 - SQLite for sources, sessions, and messages
 - Qdrant local storage + FastEmbed `BAAI/bge-small-en-v1.5`
@@ -113,25 +114,6 @@ Interpretation: the tutor is grounded — in-domain questions are answered from 
 out-of-domain questions get an honest "context does not contain the answer" instead of a guess.
 Recall is 0.85 rather than 1.0 because the ingested sources don't cover the golden human-rights topics;
 the gap measures missing knowledge, not a broken retriever.
-
-## API
-
-| Method | Path | Purpose |
-|---|---|---|
-| `POST` | `/api/upload-source` | File, URL, or pasted text |
-| `GET` | `/api/sources` | Sources, summaries, chunk counts |
-| `PATCH` | `/api/sources/{id}` | Include or mute a source |
-| `DELETE` | `/api/sources/{id}` | Delete the source and its points |
-| `GET` | `/api/collection` | The single collection |
-| `POST` | `/api/chat` | ReAct turn, citations, trace, artifacts |
-| `POST` | `/api/chat/stream` | Same turn as server-sent events |
-| `POST` | `/api/generate-podcast` | Script and 24 kHz audio |
-| `POST` | `/api/generate-quiz` | Quiz and flashcards |
-| `POST` | `/api/generate-infographic` | Mermaid diagram |
-| `GET` | `/api/sessions` | Study sessions |
-| `POST` | `/api/sessions` | Create a session |
-| `GET` | `/api/sessions/{id}` | Messages and studio artifacts |
-| `GET` | `/api/health` | Ready state. Booleans only, no secrets |
 
 ## Keys
 
